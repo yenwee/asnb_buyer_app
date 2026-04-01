@@ -80,7 +80,7 @@ class AccountRunner:
         proc = self.process
         if not proc:
             return
-        self.process = None  # Clear first to signal reader thread
+        self.process = None
         try:
             os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
             self.log("Stopping (waiting for logout)...")
@@ -99,7 +99,6 @@ class AccountRunner:
         return self.process is not None
 
     def resume(self):
-        """Send newline to stdin to unblock the subprocess waiting for resume."""
         proc = self.process
         if proc and proc.stdin:
             if self.resume_btn:
@@ -130,14 +129,12 @@ class AccountRunner:
             self.root.after(0, self.log, f"Process exited (code {return_code})")
             self.root.after(0, self._on_end)
         except (AttributeError, OSError):
-            # Process was killed/cleared by stop()
             self.root.after(0, self._on_end)
         except Exception as e:
             self.root.after(0, self.log, f"Error: {e}")
             self.root.after(0, self._on_end)
 
     def _show_resume(self):
-        """Show the resume button and update status when payment is ready."""
         self.status_label.configure(text="  PAYMENT  ", bootstyle="inverse-warning")
         self.log("Payment ready! Complete payment in browser, then click Resume.")
         if self.resume_btn:
@@ -155,7 +152,6 @@ class AccountRunner:
         self.log_widget.configure(state="normal")
         timestamp = datetime.now().strftime("%H:%M:%S")
         self.log_widget.insert("end", f"[{timestamp}] {message}\n")
-        # Trim old lines to prevent Text widget from growing unbounded
         line_count = int(self.log_widget.index("end-1c").split(".")[0])
         if line_count > self.MAX_LOG_LINES:
             self.log_widget.delete("1.0", f"{line_count - self.MAX_LOG_LINES}.0")
@@ -173,8 +169,9 @@ class ASNBApp:
         )
 
         self.runners = {}
-        self.email_vars = {}
         self.profiles = {}
+        # Per-profile UI state: {profile_key: {bank_var, amount_var, fund_vars, email_var}}
+        self.tab_vars = {}
 
         self._discover_profiles()
         self._build_ui()
@@ -183,7 +180,6 @@ class ASNBApp:
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _discover_profiles(self):
-        """Load profiles from config.ini using asnb.config module."""
         try:
             config = load_config()
             self.profiles = get_profiles(config)
@@ -207,49 +203,6 @@ class ASNBApp:
         ttk.Button(header, text="Add Profile", bootstyle="outline-success",
                    command=self._show_add_profile_dialog).pack(side=RIGHT, ipady=3)
 
-        # --- Shared Config ---
-        config_frame = ttk.Labelframe(main, text="Shared Settings", padding=12, bootstyle="info")
-        config_frame.pack(fill=X, pady=(0, 12))
-
-        # Bank + Amount row
-        row1 = ttk.Frame(config_frame)
-        row1.pack(fill=X, pady=(0, 8))
-
-        ttk.Label(row1, text="Bank", font=("-size", 12), width=8).pack(side=LEFT)
-        self.bank_var = ttk.StringVar()
-        self.bank_combo = ttk.Combobox(row1, textvariable=self.bank_var,
-                                        values=BANKS, state="readonly",
-                                        font=("-size", 12), bootstyle="info", width=22)
-        self.bank_combo.pack(side=LEFT, padx=(0, 20))
-
-        ttk.Label(row1, text="Amount", font=("-size", 12), width=8).pack(side=LEFT)
-        self.amount_var = ttk.StringVar()
-        ttk.Entry(row1, textvariable=self.amount_var,
-                  font=("-size", 13, "-weight", "bold"),
-                  bootstyle="info", width=8).pack(side=LEFT, padx=(0, 8))
-
-        for amt in AMOUNTS:
-            ttk.Button(row1, text=amt, width=5, bootstyle="outline-info",
-                       command=lambda a=amt: self.amount_var.set(a)).pack(side=LEFT, padx=1)
-
-        # Funds row
-        row2 = ttk.Frame(config_frame)
-        row2.pack(fill=X)
-
-        ttk.Label(row2, text="Funds", font=("-size", 12), width=8).pack(side=LEFT)
-        self.fund_vars = {}
-        for fund in FUNDS:
-            short = fund.replace("Amanah Saham Malaysia", "ASM").strip() or "ASM 1"
-            var = ttk.BooleanVar(value=True)
-            self.fund_vars[fund] = var
-            ttk.Checkbutton(row2, text=short, variable=var,
-                            bootstyle="info-round-toggle").pack(side=LEFT, padx=(0, 15))
-
-        ttk.Button(row2, text="All", width=4, bootstyle="outline-secondary",
-                   command=lambda: [v.set(True) for v in self.fund_vars.values()]).pack(side=LEFT, padx=2)
-        ttk.Button(row2, text="None", width=5, bootstyle="outline-secondary",
-                   command=lambda: [v.set(False) for v in self.fund_vars.values()]).pack(side=LEFT, padx=2)
-
         # --- Master Controls ---
         ctrl_frame = ttk.Frame(main)
         ctrl_frame.pack(fill=X, pady=(0, 12))
@@ -268,17 +221,25 @@ class ASNBApp:
         self._build_account_tabs()
 
     def _build_account_tabs(self):
-        """Create a tab for each discovered profile, or show empty state."""
         if not self.profiles:
             self._build_empty_state()
             return
+
+        # Load config once for reading defaults
+        config = configparser.ConfigParser()
+        if Path(CONFIG_FILE).exists():
+            config.read(CONFIG_FILE)
+        default_bank = config.get('Settings', 'bank_name', fallback='Public Bank')
+        default_amount = config.get('Settings', 'purchase_amount', fallback='500')
+        default_funds_str = config.get('Settings', 'funds_to_try', fallback='')
+        default_funds = [f.strip() for f in default_funds_str.split(',') if f.strip()]
 
         for profile_key, profile_data in self.profiles.items():
             tab = ttk.Frame(self.notebook, padding=8)
             tab_label = profile_key.title()
             self.notebook.add(tab, text=f"  {tab_label}  ")
 
-            # Tab header with individual controls
+            # --- Tab header with status + controls ---
             tab_header = ttk.Frame(tab)
             tab_header.pack(fill=X, pady=(0, 6))
 
@@ -300,26 +261,82 @@ class ASNBApp:
 
             resume_btn = ttk.Button(tab_header, text="Resume", bootstyle="warning", width=8,
                                      command=lambda k=profile_key: self.runners[k].resume())
-            # Hidden by default - shown when payment is ready
 
             ttk.Button(tab_header, text="Clear", bootstyle="outline-secondary", width=5,
                        command=lambda t=tab: self._clear_tab_log(t)).pack(side=RIGHT, padx=(0, 8))
 
-            # Email recipient row
-            email_row = ttk.Frame(tab)
-            email_row.pack(fill=X, pady=(0, 6))
+            # --- Per-profile settings ---
+            settings_frame = ttk.Labelframe(tab, text="Settings", padding=8, bootstyle="info")
+            settings_frame.pack(fill=X, pady=(0, 6))
 
-            ttk.Label(email_row, text="Notify:", font=("-size", 11), width=7).pack(side=LEFT)
+            # Bank + Amount row
+            row1 = ttk.Frame(settings_frame)
+            row1.pack(fill=X, pady=(0, 5))
+
+            ttk.Label(row1, text="Bank", font=("-size", 11), width=7).pack(side=LEFT)
+            bank_var = ttk.StringVar()
+            ttk.Combobox(row1, textvariable=bank_var, values=BANKS, state="readonly",
+                         font=("-size", 11), bootstyle="info", width=20).pack(side=LEFT, padx=(0, 15))
+
+            ttk.Label(row1, text="Amount", font=("-size", 11), width=7).pack(side=LEFT)
+            amount_var = ttk.StringVar()
+            ttk.Entry(row1, textvariable=amount_var,
+                      font=("-size", 12, "-weight", "bold"),
+                      bootstyle="info", width=7).pack(side=LEFT, padx=(0, 6))
+
+            for amt in AMOUNTS:
+                ttk.Button(row1, text=amt, width=5, bootstyle="outline-info",
+                           command=lambda a=amt, v=amount_var: v.set(a)).pack(side=LEFT, padx=1)
+
+            # Funds row
+            row2 = ttk.Frame(settings_frame)
+            row2.pack(fill=X, pady=(0, 3))
+
+            ttk.Label(row2, text="Funds", font=("-size", 11), width=7).pack(side=LEFT)
+            fund_vars = {}
+            for fund in FUNDS:
+                short = fund.replace("Amanah Saham Malaysia", "ASM").strip() or "ASM 1"
+                var = ttk.BooleanVar(value=True)
+                fund_vars[fund] = var
+                ttk.Checkbutton(row2, text=short, variable=var,
+                                bootstyle="info-round-toggle").pack(side=LEFT, padx=(0, 12))
+
+            ttk.Button(row2, text="All", width=4, bootstyle="outline-secondary",
+                       command=lambda fv=fund_vars: [v.set(True) for v in fv.values()]).pack(side=LEFT, padx=2)
+            ttk.Button(row2, text="None", width=5, bootstyle="outline-secondary",
+                       command=lambda fv=fund_vars: [v.set(False) for v in fv.values()]).pack(side=LEFT, padx=2)
+
+            # Email row
+            row3 = ttk.Frame(settings_frame)
+            row3.pack(fill=X)
+
+            ttk.Label(row3, text="Notify", font=("-size", 11), width=7).pack(side=LEFT)
             email_var = ttk.StringVar(value=profile_data.get("recipient_email", ""))
-            email_entry = ttk.Entry(email_row, textvariable=email_var,
-                                     font=("-size", 11), bootstyle="info", width=35)
-            email_entry.pack(side=LEFT, padx=(0, 5))
-            ttk.Label(email_row, text="(comma-separated for multiple)",
+            ttk.Entry(row3, textvariable=email_var, font=("-size", 11),
+                      bootstyle="info", width=30).pack(side=LEFT, padx=(0, 5))
+            ttk.Label(row3, text="(comma-separated)",
                       font=("-size", 10), bootstyle="secondary").pack(side=LEFT)
 
-            self.email_vars[profile_key] = email_var
+            # Set values: profile override > global default
+            prof_bank = profile_data.get('bank_name', default_bank)
+            prof_amount = profile_data.get('purchase_amount', default_amount)
+            prof_funds_str = profile_data.get('funds_to_try', '')
+            prof_funds = [f.strip() for f in prof_funds_str.split(',') if f.strip()] if prof_funds_str else default_funds
 
-            # Log area
+            bank_var.set(prof_bank)
+            amount_var.set(prof_amount)
+            for fund, var in fund_vars.items():
+                var.set(fund in prof_funds)
+
+            # Store vars for saving
+            self.tab_vars[profile_key] = {
+                'bank_var': bank_var,
+                'amount_var': amount_var,
+                'fund_vars': fund_vars,
+                'email_var': email_var,
+            }
+
+            # --- Log area ---
             log_frame = ttk.Frame(tab)
             log_frame.pack(fill=BOTH, expand=YES)
 
@@ -339,7 +356,6 @@ class ASNBApp:
             )
 
     def _build_empty_state(self):
-        """Show a placeholder when no profiles are found."""
         empty = ttk.Frame(self.notebook, padding=30)
         self.notebook.add(empty, text="  No Profiles  ")
         ttk.Label(empty, text="No profiles found in config.ini",
@@ -350,18 +366,15 @@ class ASNBApp:
                    command=self._show_add_profile_dialog).pack(pady=20, ipady=5)
 
     def _reload_profiles(self):
-        """Re-read config.ini, stop runners, and rebuild all tabs."""
         self._stop_all()
         for tab_id in self.notebook.tabs():
             self.notebook.forget(tab_id)
         self.runners.clear()
-        self.email_vars.clear()
+        self.tab_vars.clear()
         self._discover_profiles()
         self._build_account_tabs()
-        self._load_config_to_ui()
 
     def _show_add_profile_dialog(self):
-        """Open a dialog to create a new profile and write it to config.ini."""
         dialog = ttk.Toplevel(self.root)
         dialog.title("Add Profile")
         dialog.geometry("450x420")
@@ -391,7 +404,6 @@ class ASNBApp:
                 ttk.Entry(row, textvariable=var, width=30).pack(side=LEFT, fill=X, expand=YES)
             fields[key] = var
 
-        # Bank dropdown
         row = ttk.Frame(frame)
         row.pack(fill=X, pady=3)
         ttk.Label(row, text="Bank", width=16).pack(side=LEFT)
@@ -399,11 +411,9 @@ class ASNBApp:
         ttk.Combobox(row, textvariable=bank_var, values=BANKS, state="readonly", width=27).pack(side=LEFT)
         fields["bank_name"] = bank_var
 
-        # Error label (hidden initially)
         error_var = ttk.StringVar()
-        error_label = ttk.Label(frame, textvariable=error_var, bootstyle="danger",
-                                font=("-size", 10), wraplength=400)
-        error_label.pack(fill=X, pady=(8, 0))
+        ttk.Label(frame, textvariable=error_var, bootstyle="danger",
+                  font=("-size", 10), wraplength=400).pack(fill=X, pady=(8, 0))
 
         def save():
             error_var.set("")
@@ -438,50 +448,23 @@ class ASNBApp:
                    command=save).pack(pady=(15, 0), ipady=5)
 
     def _load_config_to_ui(self):
-        config = configparser.ConfigParser()
-        if not Path(CONFIG_FILE).exists():
-            if Path(CONFIG_TEMPLATE).exists():
-                import shutil
-                shutil.copy(CONFIG_TEMPLATE, CONFIG_FILE)
-            else:
-                return
-        config.read(CONFIG_FILE)
-
-        self.bank_var.set(config.get('Settings', 'bank_name', fallback='Public Bank'))
-        self.amount_var.set(config.get('Settings', 'purchase_amount', fallback='500'))
-
-        funds_str = config.get('Settings', 'funds_to_try', fallback='')
-        active_funds = [f.strip() for f in funds_str.split(',') if f.strip()]
-        for fund, var in self.fund_vars.items():
-            var.set(fund in active_funds)
-
-        # Load per-profile email recipients
-        for profile_key, email_var in self.email_vars.items():
-            section = f'Profile.{profile_key}'
-            if section in config:
-                saved_email = config.get(section, 'recipient_email', fallback='')
-                if saved_email:
-                    email_var.set(saved_email)
+        """Load is handled during tab creation via profile_data + defaults."""
+        pass
 
     def _save_config(self):
         config = configparser.ConfigParser()
         config.read(CONFIG_FILE)
 
-        if 'Settings' not in config:
-            config['Settings'] = {}
-
-        selected_funds = [f for f, v in self.fund_vars.items() if v.get()]
-        config['Settings']['funds_to_try'] = ", ".join(selected_funds)
-        config['Settings']['purchase_amount'] = self.amount_var.get()
-        config['Settings']['bank_name'] = self.bank_var.get()
-        config['Settings']['loop_tries'] = config.get('Settings', 'loop_tries', fallback='0')
-        config['Settings']['session_refresh_interval'] = config.get('Settings', 'session_refresh_interval', fallback='6')
-
-        # Save per-profile email recipients
-        for profile_key, email_var in self.email_vars.items():
+        for profile_key, vars_dict in self.tab_vars.items():
             section = f'Profile.{profile_key}'
-            if section in config:
-                config[section]['recipient_email'] = email_var.get().strip()
+            if section not in config:
+                continue
+
+            selected_funds = [f for f, v in vars_dict['fund_vars'].items() if v.get()]
+            config[section]['funds_to_try'] = ", ".join(selected_funds)
+            config[section]['purchase_amount'] = vars_dict['amount_var'].get()
+            config[section]['bank_name'] = vars_dict['bank_var'].get()
+            config[section]['recipient_email'] = vars_dict['email_var'].get().strip()
 
         with open(CONFIG_FILE, 'w') as f:
             config.write(f)
@@ -490,20 +473,27 @@ class ASNBApp:
             runner.log("Config saved.")
 
     def _start_one(self, profile_key):
-        if not self._validate():
+        vars_dict = self.tab_vars.get(profile_key, {})
+        fund_vars = vars_dict.get('fund_vars', {})
+        selected = [f for f, v in fund_vars.items() if v.get()]
+        if not selected:
+            self.runners[profile_key].log("Select at least one fund.")
             return
+        amount = vars_dict.get('amount_var', ttk.StringVar()).get()
+        if not amount.strip():
+            self.runners[profile_key].log("Enter an amount.")
+            return
+
         self._save_config()
         runner = self.runners[profile_key]
         if not runner.is_running:
-            runner.log(f"Funds: {', '.join(f for f, v in self.fund_vars.items() if v.get())}")
-            runner.log(f"Amount: RM {self.amount_var.get()} | Bank: {self.bank_var.get()}")
+            bank = vars_dict.get('bank_var', ttk.StringVar()).get()
+            runner.log(f"Funds: {', '.join(selected)}")
+            runner.log(f"Amount: RM {amount} | Bank: {bank}")
             runner.log("-" * 50)
             runner.start()
 
     def _start_all(self):
-        if not self._validate():
-            return
-        self._save_config()
         for key in self.runners:
             self._start_one(key)
 
@@ -511,18 +501,6 @@ class ASNBApp:
         for runner in self.runners.values():
             if runner.is_running:
                 runner.stop()
-
-    def _validate(self):
-        selected = [f for f, v in self.fund_vars.items() if v.get()]
-        if not selected:
-            for r in self.runners.values():
-                r.log("Select at least one fund.")
-            return False
-        if not self.amount_var.get().strip():
-            for r in self.runners.values():
-                r.log("Enter an amount.")
-            return False
-        return True
 
     def _clear_tab_log(self, tab):
         for widget in tab.winfo_children():
@@ -546,7 +524,6 @@ if __name__ == "__main__":
 
     app = ASNBApp()
 
-    # Ensure child processes are killed even if GUI is force-quit
     def _cleanup():
         for runner in app.runners.values():
             proc = runner.process
