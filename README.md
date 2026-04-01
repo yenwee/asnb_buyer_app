@@ -1,41 +1,73 @@
 <p align="center">
-  <img src="logo.jpg" alt="ASNB Logo" width="200" height="200">
+  <img src="logo.jpg" alt="ASNB Buyer" width="200" height="200">
 </p>
 
-# MyASNB Buyer Automation
+<h1 align="center">MyASNB Buyer Automation</h1>
 
-[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/yenwee)
+<p align="center">
+  <strong>Stop refreshing. Let the bot retry for you.</strong>
+</p>
 
-Automates ASNB fund unit purchases through the MyASNB portal. Handles login, fund selection, purchase submission, and retries -- then pauses at the FPX payment page for you to complete the bank transfer manually.
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.11+-blue.svg" alt="Python">
+  <img src="https://img.shields.io/github/v/release/yenwee/asnb_buyer_app" alt="Release">
+  <img src="https://img.shields.io/github/license/yenwee/asnb_buyer_app" alt="License">
+  <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux%20%7C%20Windows-lightgrey" alt="Platform">
+</p>
 
-> **Disclaimer:** Use at your own risk. Website structures can change and break the script. The script pauses at the payment page -- you must complete payment manually. We are not responsible for any financial loss or account issues.
+<p align="center">
+  <a href="https://ko-fi.com/yenwee"><img src="https://ko-fi.com/img/githubbutton_sm.svg" alt="Support on Ko-fi"></a>
+</p>
 
-## Features
+---
 
-- Multi-account support -- run multiple profiles simultaneously
-- GUI launcher with per-account tabs and live log output
-- Configurable funds, amounts, and banks per profile
-- Retry on "insufficient units" (068), skip on "blocked" (1001)
-- Session auto-refresh to prevent stale portfolio data
-- Email notifications with screenshots on successful purchase
-- Direct URL logout for reliable session cleanup
-- Debug snapshots on failures for troubleshooting
+## The Problem
+
+ASNB fixed-price funds (ASM, ASM2, ASM3) are almost always fully subscribed. When units become available, they sell out in **seconds**. Buying manually means:
+
+- Refreshing the portal over and over
+- Clicking through 5 screens as fast as possible
+- Getting "insufficient units" errors 99% of the time
+- Doing this for hours, days, or weeks
+
+## The Solution
+
+This tool sits in the retry loop for you. It logs in, selects your fund, submits the purchase, and **retries automatically** when units aren't available. When it finally succeeds, it notifies you and pauses for you to complete the FPX bank payment manually.
+
+**You set it up once, walk away, and get an email when it's time to pay.**
+
+### Key Features
+
+- **Multi-account** -- run multiple MyASNB accounts simultaneously
+- **Smart retry** -- handles "insufficient units" (068) with automatic retry, skips "blocked" (1001) funds
+- **GUI + CLI** -- visual launcher with per-account tabs, or simple `make run P=profile`
+- **Per-profile settings** -- different bank, amount, and funds for each account
+- **Email alerts** -- get notified with a screenshot when purchase succeeds
+- **Session management** -- auto-refreshes login to prevent stale data
+- **Debug snapshots** -- screenshots + reports saved on any failure
+
+> **Note:** This tool automates everything *except* the actual payment. You must complete the FPX bank transfer yourself when prompted.
+
+---
 
 ## Quick Start
 
 ```bash
-# 1. Setup
+# 1. Clone and setup
+git clone https://github.com/yenwee/asnb_buyer_app.git
+cd asnb_buyer_app
 make setup
 
-# 2. Edit config.ini -- add your profile(s)
-#    See config.ini.template for all options
+# 2. Add your account
+cp config.ini.template config.ini
+# Edit config.ini -- add your [Profile.xxx] section (see below)
 
-# 3. Run (pick one)
-make run P=yenwee          # CLI - single profile
-make gui                   # GUI - all profiles with tabs
+# 3. Run
+make run P=yourprofile     # CLI mode
+make gui                   # GUI mode (all profiles)
 ```
 
-## Purchase Flow
+## How It Works
 
 ```mermaid
 flowchart TD
@@ -50,49 +82,45 @@ flowchart TD
     G --> H[Submit Purchase]
 
     H --> I{Result?}
-    I -->|Success| J[Notify + Pause for Payment]
+    I -->|Success| J["Notify + Pause for Payment"]
     I -->|068 Insufficient| K[Retry up to 30x]
     K --> H
     I -->|1001 Blocked| L[Try Next Fund]
     L --> F
 
-    J --> M[Complete FPX Payment Manually]
+    J --> M[You Complete FPX Payment]
 ```
 
 ## Configuration
 
-All settings live in `config.ini`. Copy from template:
-
-```bash
-cp config.ini.template config.ini
-```
-
 ### Profile Setup
 
-Each `[Profile.xxx]` section is one MyASNB account:
+Each `[Profile.xxx]` section in `config.ini` is one MyASNB account:
 
 ```ini
-[Profile.yenwee]
-username = your_myasnb_username
-password = your_myasnb_password
-security_phrase = your_phrase
-bank_name = Hong Leong Bank        # optional, falls back to [Settings]
-purchase_amount = 5000              # optional
-funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2  # optional
-recipient_email = you@email.com    # optional
+[Profile.ali]
+username = asnb1234              # MyASNB login ID
+password = MyP@ssw0rd            # MyASNB password
+security_phrase = my phrase       # Phrase shown after username entry
+bank_name = Maybank2U            # FPX bank (see list below)
+purchase_amount = 1000           # RM per attempt
+funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2
+recipient_email = ali@gmail.com  # Email notification
 ```
+
+You can have as many profiles as you want. Run them all at once with `make gui` or one at a time with `make run P=ali`.
 
 ### Global Defaults
 
-`[Settings]` provides defaults that profiles can override:
+`[Settings]` provides fallbacks for any field not set in a profile:
 
 ```ini
 [Settings]
 funds_to_try = Amanah Saham Malaysia 2
 purchase_amount = 100
 bank_name = Public Bank
-loop_tries = 0                      # 0 = infinite
-session_refresh_interval = 6        # logout/re-login every N fund attempts
+loop_tries = 0                   # 0 = infinite retry
+session_refresh_interval = 6     # re-login every N fund attempts
 ```
 
 ### Available Banks
@@ -103,39 +131,31 @@ Affin Bank, Alliance Bank, AmBank, Bank Islam, Bank Rakyat, Bank Muamalat, CIMB 
 
 ```ini
 [Email]
-smtp_server = smtp.gmail.com       # Gmail requires App Password
+smtp_server = smtp.gmail.com    # Gmail requires App Password
 smtp_port = 587
 sender_email = you@gmail.com
 sender_password = your_app_password
 recipient_email = you@gmail.com
 send_on_success = true
-send_on_failure = false
 ```
 
-## Usage
+## Commands
 
 ```bash
-# Run a specific profile
-make run P=yenwee
-
-# List available profiles
-make run
-
-# Launch GUI (all profiles, with Add Profile button)
-make gui
-
-# Monitor logs
-make tail
-
-# Stop everything
-make stop
+make run P=ali     # Run a specific profile
+make run           # List available profiles
+make gui           # Launch GUI (all profiles)
+make tail          # Live log output
+make stop          # Stop everything
+make status        # Check running processes
+make clean         # Clean temp files
 ```
 
 ## Architecture
 
 ```
 asnb/
-  main.py       Automation engine (login, purchase, retry loops, session management)
+  main.py       Automation engine -- login, purchase, retry loops, session mgmt
   config.py     Config loading + profile discovery
   driver.py     Chrome/Brave WebDriver setup (ARM64 Mac compatible)
   email.py      SMTP notifications with screenshot attachments
@@ -143,37 +163,31 @@ asnb/
   gui.py        ttkbootstrap GUI with multi-account tabs
 ```
 
-## How It Works
-
-1. **Config**: Loads profile credentials and settings from `config.ini`
-2. **WebDriver**: Initializes Chrome (or Brave fallback on macOS) via `webdriver-manager`
-3. **Login**: Handles popup dismissal, active session conflicts (90s wait + retry)
-4. **Purchase Loop**: For each fund, enters amount, selects bank, retries up to 30x on 068 errors
-5. **On Success**: Sends email notification, plays sound, pauses for manual FPX payment
-6. **Session Refresh**: Proactive logout/re-login every N attempts to prevent stale data
-7. **Resume**: After payment, press Enter (CLI) or click Resume (GUI) to continue with remaining funds
-
 ## Troubleshooting
 
 | Problem | Solution |
 |---------|----------|
-| Login fails | Check username/password in config.ini. Active session clears in ~1 min. |
-| Element not found | Website may have changed. Check debug_snapshots/ for screenshots. |
-| WebDriver error | Ensure Chrome/Brave installed. Delete `~/.wdm` to force fresh driver. |
-| Bank not found | Check exact spelling in config.ini (case-sensitive, e.g., `Maybank2U`). |
-| Email not sending | Use App Password for Gmail. Check smtp settings and spam folder. |
+| Login fails | Check username/password. Active session clears in ~1 min. |
+| Element not found | Website may have changed. Check `debug_snapshots/` for clues. |
+| WebDriver error | Ensure Chrome/Brave installed. Delete `~/.wdm` for fresh driver. |
+| Bank not found | Exact spelling matters (e.g., `Maybank2U` not `maybank`). |
+| Email not sending | Use Gmail App Password (not regular password). Check spam. |
 | Funds not loading | Session refresh triggers automatically. Restart if persistent. |
 
-## Prerequisites
+## Requirements
 
 - Python 3.11+
 - Google Chrome (primary) or Brave Browser (macOS fallback)
 - macOS, Linux, or Windows
 
+## Disclaimer
+
+This tool automates browser interactions with the MyASNB portal. Use it responsibly and at your own risk. Website changes may break functionality. We are not responsible for any financial loss or account issues. Always complete FPX payments manually.
+
 ## Contributing
 
-Contributions welcome! Please open issues for bugs or feature suggestions.
+Contributions welcome! Check out the [open issues](https://github.com/yenwee/asnb_buyer_app/issues) -- several are tagged `good first issue`.
 
 ## License
 
-MIT License -- see `LICENSE` for details.
+MIT License -- see [LICENSE](LICENSE) for details.
