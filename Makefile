@@ -10,6 +10,8 @@ setup: ## First time setup (venv + deps + config)
 	@echo "Setup complete. Edit config.ini to add your [Profile.xxx] section, then run 'make gui' or 'make run P=xxx'."
 
 run: ## Run automation (usage: make run P=<profile>)
+	@test -d .venv || { echo "Error: Run 'make setup' first."; exit 1; }
+	@test -f config.ini || { echo "Error: config.ini not found. Run 'make setup' then edit config.ini."; exit 1; }
 ifeq ($(P),)
 	@echo "Usage: make run P=<profile>"
 	@echo ""
@@ -25,6 +27,8 @@ else
 endif
 
 gui: ## Launch GUI (multi-account)
+	@test -d .venv || { echo "Error: Run 'make setup' first."; exit 1; }
+	@test -f config.ini || { echo "Error: config.ini not found. Run 'make setup' then edit config.ini."; exit 1; }
 	.venv/bin/python -m asnb.gui
 
 stop: ## Stop all running instances
