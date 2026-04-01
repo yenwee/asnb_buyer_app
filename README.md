@@ -48,6 +48,8 @@ This tool sits in the retry loop for you. It logs in, selects your fund, submits
 
 > **Note:** This tool automates everything *except* the actual payment. You must complete the FPX bank transfer yourself when prompted.
 
+> **Legal:** This uses your own credentials for personal use. No security measures are bypassed. Use at your own risk -- see [Disclaimer](#disclaimer).
+
 ---
 
 ## Quick Start
@@ -188,7 +190,7 @@ This tool automates browser interactions with the MyASNB portal using **your own
 - **Website changes may break functionality.** ASNB may update their portal at any time.
 - **This is not financial advice.** Decide independently whether to invest in ASNB funds.
 - **FPX payments are always manual.** The script pauses and waits for you to complete payment yourself.
-- **For zero-risk automation**, consider [ASNB's official Ria robo-advisor service](https://www.myasnb.com.my/).
+- **Not affiliated with ASNB or PNB.** This is an independent open-source project.
 
 ## Contributing
 
