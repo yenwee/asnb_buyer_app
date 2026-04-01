@@ -1,0 +1,63 @@
+# ASNB Buyer - Configuration
+# Copy this file to config.ini and fill in your details:
+#   cp config.ini.template config.ini
+
+[Settings]
+# Global defaults - profiles can override any of these
+funds_to_try = Amanah Saham Malaysia 2
+purchase_amount = 100
+bank_name = Public Bank
+loop_tries = 0
+session_refresh_interval = 6
+
+[Email]
+# SMTP settings for purchase notifications (shared across all profiles)
+# Leave blank to disable email notifications
+# Gmail: use smtp.gmail.com port 587 with an App Password
+#   (Google Account > Security > 2-Step Verification > App passwords)
+smtp_server =
+smtp_port = 587
+sender_email =
+sender_password =
+recipient_email =
+send_on_success = true
+send_on_failure = false
+email_subject = ASNB Purchase Notification
+
+# --- Profiles ---
+# Each [Profile.xxx] section is one MyASNB account.
+# Run with: make run P=xxx  or  python -m asnb.main --profile xxx
+#
+# Required: username, password, security_phrase
+#   - username: your MyASNB login ID (e.g. asnb1234)
+#   - password: your MyASNB password
+#   - security_phrase: the phrase shown after entering username
+#
+# Optional overrides (falls back to [Settings] if not set):
+#   bank_name, purchase_amount, funds_to_try,
+#   loop_tries, session_refresh_interval, recipient_email
+#
+# Available banks:
+#   Affin Bank, Alliance Bank, AmBank, Bank Islam, Bank Rakyat,
+#   Bank Muamalat, CIMB Clicks, Hong Leong Bank, HSBC Bank,
+#   Maybank2U, Public Bank, RHB Bank, UOB Bank, BSN, KFH,
+#   Maybank2E, OCBC Bank, Standard Chartered, AGRONet, Bank of China
+
+# Example profile - rename and fill in your details:
+[Profile.example]
+username = asnb1234
+password = MyP@ssw0rd123
+security_phrase = my secret phrase
+# bank_name = Maybank2U
+# purchase_amount = 1000
+# funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2
+# recipient_email = ali@gmail.com
+
+# You can add multiple profiles:
+# [Profile.wife]
+# username = asnb5678
+# password = HerP@ss456
+# security_phrase = her phrase here
+# bank_name = CIMB Clicks
+# purchase_amount = 500
+# recipient_email = wife@gmail.com
