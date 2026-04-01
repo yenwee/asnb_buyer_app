@@ -1,0 +1,21 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Config with secrets
+config.ini
+
+# Runtime artifacts
+*.log
+*.png
+debug_snapshots/
+
+# Internal docs
+docs/
+
+# IDE/OS
+.DS_Store
+.playwright-mcp/
+CLAUDE.md
+Thumbs.db
