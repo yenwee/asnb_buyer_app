@@ -182,7 +182,13 @@ asnb/
 
 ## Disclaimer
 
-This tool automates browser interactions with the MyASNB portal. Use it responsibly and at your own risk. Website changes may break functionality. We are not responsible for any financial loss or account issues. Always complete FPX payments manually.
+This tool automates browser interactions with the MyASNB portal using **your own credentials** for **personal use**. It does not bypass any security measures, CAPTCHAs, or access controls.
+
+- **Use at your own risk.** We are not responsible for any financial loss, account suspension, or other consequences.
+- **Website changes may break functionality.** ASNB may update their portal at any time.
+- **This is not financial advice.** Decide independently whether to invest in ASNB funds.
+- **FPX payments are always manual.** The script pauses and waits for you to complete payment yourself.
+- **For zero-risk automation**, consider [ASNB's official Ria robo-advisor service](https://www.myasnb.com.my/).
 
 ## Contributing
 
