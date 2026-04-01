@@ -54,19 +54,26 @@ This tool sits in the retry loop for you. It logs in, selects your fund, submits
 
 ## Quick Start
 
+### macOS / Linux
+
 ```bash
-# 1. Clone and setup
 git clone https://github.com/yenwee/asnb_buyer_app.git
 cd asnb_buyer_app
-make setup
-
-# 2. Add your account
-cp config.ini.template config.ini
+make setup                 # creates venv, installs deps, copies config template
 # Edit config.ini -- add your [Profile.xxx] section (see below)
-
-# 3. Run
 make run P=yourprofile     # CLI mode
 make gui                   # GUI mode (all profiles)
+```
+
+### Windows
+
+```
+git clone https://github.com/yenwee/asnb_buyer_app.git
+cd asnb_buyer_app
+setup.bat                  # creates venv, installs deps, copies config template
+# Edit config.ini -- add your [Profile.xxx] section (see below)
+run.bat yourprofile        # CLI mode
+gui.bat                    # GUI mode (all profiles)
 ```
 
 ## How It Works
@@ -143,14 +150,20 @@ send_on_success = true
 
 ## Commands
 
+### macOS / Linux
 ```bash
 make run P=ali     # Run a specific profile
 make run           # List available profiles
 make gui           # Launch GUI (all profiles)
 make tail          # Live log output
 make stop          # Stop everything
-make status        # Check running processes
-make clean         # Clean temp files
+```
+
+### Windows
+```
+run.bat ali        # Run a specific profile
+run.bat            # List available profiles
+gui.bat            # Launch GUI (all profiles)
 ```
 
 ## Architecture
