@@ -19,26 +19,38 @@ if platform.system() == "Windows":
 
 # --- Logging Setup ---
 LOG_DIR = Path(".")
-LOG_FILE = LOG_DIR / f"asnb_buyer_{datetime.now().strftime('%Y%m%d')}.log"
 
-# Configure logging to both console and file
-logger = logging.getLogger("asnb_buyer")
-logger.setLevel(logging.INFO)
-
-# File handler - append mode, one log file per day
-file_handler = logging.FileHandler(LOG_FILE, mode='a', encoding='utf-8')
-file_handler.setFormatter(logging.Formatter('%(asctime)s | %(message)s', datefmt='%H:%M:%S'))
-logger.addHandler(file_handler)
-
-# Console handler - flush after every message so GUI pipe receives output immediately
 class _FlushingStreamHandler(logging.StreamHandler):
     def emit(self, record):
         super().emit(record)
         self.flush()
 
-console_handler = _FlushingStreamHandler(sys.stdout)
-console_handler.setFormatter(logging.Formatter('%(message)s'))
-logger.addHandler(console_handler)
+logger = logging.getLogger("asnb_buyer")
+logger.setLevel(logging.INFO)
+
+# Console handler always active
+_console_handler = _FlushingStreamHandler(sys.stdout)
+_console_handler.setFormatter(logging.Formatter('%(message)s'))
+logger.addHandler(_console_handler)
+
+_file_handler = None
+
+def setup_logging(profile: Optional[str] = None):
+    """Configure per-profile log file. Call after profile is known."""
+    global _file_handler
+    if _file_handler:
+        logger.removeHandler(_file_handler)
+    suffix = f"_{profile}" if profile else ""
+    log_file = LOG_DIR / f"asnb_buyer{suffix}_{datetime.now().strftime('%Y%m%d')}.log"
+    _file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+    prefix = f"[{profile}] " if profile else ""
+    _file_handler.setFormatter(logging.Formatter(f'%(asctime)s | {prefix}%(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(_file_handler)
+    # Also update console format with profile prefix
+    _console_handler.setFormatter(logging.Formatter(f'{prefix}%(message)s'))
+
+# Default log file (before profile is known)
+setup_logging()
 
 # Override print to also log to file
 _original_print = print
@@ -417,14 +429,27 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str)
             active_session_element = driver.find_element(By.XPATH, active_session_error_xpath)
             if active_session_element.is_displayed():
                 error_text = active_session_element.text
-                print(f"⚠️ Active session detected: {error_text}")
-                print("Waiting 90 seconds for session to clear (actual wait time is usually ~1 minute)...")
-                
-                # Wait 90 seconds with progress indication
-                for remaining in range(90, 0, -10):
-                    print(f"⏳ Waiting... {remaining} seconds remaining")
+                print(f"Active session detected: {error_text}")
+
+                # Try to force-kill the stale session by hitting /logout
+                print("Attempting to clear stale session via /logout...")
+                try:
+                    driver.get(MYASNB_LOGOUT_URL)
+                    time.sleep(3)
+                    current = driver.current_url
+                    if '/logout' in current or '/login' in current:
+                        print("Stale session cleared via /logout. Retrying login...")
+                        time.sleep(2)
+                        return False  # Retry login immediately
+                except Exception as e:
+                    print(f"Force logout attempt failed: {e}")
+
+                # Fallback: wait for server-side session timeout
+                print("Waiting 60 seconds for server to release session...")
+                for remaining in range(60, 0, -10):
+                    print(f"Waiting... {remaining} seconds remaining")
                     time.sleep(10)
-                
+
                 print("Session wait completed. Returning False to trigger retry...")
                 save_debug_snapshot(driver, f"Active session conflict: {error_text}", "login")
                 return False  # Return False to indicate login should be retried
@@ -1079,6 +1104,7 @@ def main(profile=None):
     """
     driver = None
     chrome_restart_count = 0
+    setup_logging(profile)
     try:
         label = f" [{profile}]" if profile else ""
         print(f"--- Starting MyASNB Buyer Automation{label} ---")
@@ -1227,11 +1253,20 @@ def main(profile=None):
 
                 # Every Nth session refresh, also restart Chrome to prevent memory leaks
                 if chrome_restart_count % CHROME_RESTART_INTERVAL == 0:
-                    print(f"🔄 Full Chrome restart (refresh #{chrome_restart_count}) to free memory...")
+                    print(f"Full Chrome restart (refresh #{chrome_restart_count}) to free memory...")
                     try:
-                        logout(driver)
+                        if logout(driver):
+                            print("Logout confirmed. Waiting for server to release session...")
+                            time.sleep(3)  # Give server time to fully terminate session
+                        else:
+                            print("Logout returned failure. Clearing cookies as fallback...")
+                            try:
+                                driver.delete_all_cookies()
+                            except Exception:
+                                pass
+                            time.sleep(3)
                     except Exception:
-                        pass
+                        time.sleep(3)
                     try:
                         driver.quit()
                         print("Old Chrome closed.")

@@ -6,6 +6,7 @@ from selenium.common.exceptions import WebDriverException
 from typing import Type, Union
 import os
 import platform
+import signal
 import time
 import subprocess
 
@@ -100,10 +101,16 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
                 ChromeDriverManager().install()
                 
                 print("Initializing Chrome WebDriver (auto-detect mode for ARM64 compatibility)...")
-                
-                # Use auto-detection method that works reliably on ARM64 Mac
-                # This avoids the status code -9 issue by letting Chrome find its own driver
-                driver = webdriver.Chrome(options=chrome_options)
+
+                # Start Chrome in its own process group so Ctrl+C (SIGINT) only goes to Python,
+                # not Chrome. This lets Python logout gracefully before killing Chrome.
+                service = ChromeService()
+                if platform.system() != "Windows":
+                    service.popen_kw = {"preexec_fn": os.setpgrp}
+                else:
+                    import subprocess as _sp
+                    service.creation_flags = _sp.CREATE_NEW_PROCESS_GROUP
+                driver = webdriver.Chrome(service=service, options=chrome_options)
                 
                 # Mask navigator.webdriver before any navigation
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
