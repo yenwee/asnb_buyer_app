@@ -19,9 +19,25 @@ CONFIG_TEMPLATE = "config.ini.template"
 
 FUNDS = [
     "Amanah Saham Malaysia",
-    "Amanah Saham Malaysia 2",
+    "Amanah Saham Malaysia 2 Wawasan",
     "Amanah Saham Malaysia 3",
 ]
+
+FUND_ALIASES = {
+    "Amanah Saham Malaysia 2 Wawasan": {
+        "Amanah Saham Malaysia 2",
+        "Amanah Saham Malaysia 2 Wawasan",
+        "Amanah Saham Malaysia 2 - Wawasan",
+        "ASM 2",
+        "ASM 2 Wawasan",
+        "ASM 2 - Wawasan",
+    },
+}
+
+def fund_selected_by_config(gui_fund, configured_funds):
+    if gui_fund in configured_funds:
+        return True
+    return any(alias in configured_funds for alias in FUND_ALIASES.get(gui_fund, set()))
 
 BANKS = [
     "Affin Bank", "Alliance Bank", "AmBank", "Bank Islam", "Bank Rakyat",
@@ -231,10 +247,20 @@ class ASNBApp:
             config.read(CONFIG_FILE)
         default_bank = config.get('Settings', 'bank_name', fallback='Public Bank')
         default_amount = config.get('Settings', 'purchase_amount', fallback='500')
+        default_referral = config.get('Settings', 'referral_code', fallback='')
         default_funds_str = config.get('Settings', 'funds_to_try', fallback='')
         default_funds = [f.strip() for f in default_funds_str.split(',') if f.strip()]
+        default_ui_funds = [fund for fund in FUNDS if fund_selected_by_config(fund, default_funds)]
+        default_values = {
+            'funds_to_try': ", ".join(default_ui_funds),
+            'purchase_amount': default_amount,
+            'bank_name': default_bank,
+            'referral_code': default_referral,
+            'recipient_email': '',
+        }
 
         for profile_key, profile_data in self.profiles.items():
+            profile_keys = set(profile_data.keys())
             tab = ttk.Frame(self.notebook, padding=8)
             tab_label = profile_key.title()
             self.notebook.add(tab, text=f"  {tab_label}  ")
@@ -306,34 +332,58 @@ class ASNBApp:
             ttk.Button(row2, text="None", width=5, bootstyle="outline-secondary",
                        command=lambda fv=fund_vars: [v.set(False) for v in fv.values()]).pack(side=LEFT, padx=2)
 
-            # Email row
+            # Referral code row
             row3 = ttk.Frame(settings_frame)
-            row3.pack(fill=X)
+            row3.pack(fill=X, pady=(0, 5))
 
-            ttk.Label(row3, text="Notify", font=("-size", 11), width=7).pack(side=LEFT)
+            ttk.Label(row3, text="Referral", font=("-size", 11), width=7).pack(side=LEFT)
+            referral_var = ttk.StringVar()
+            ttk.Entry(row3, textvariable=referral_var, font=("-size", 11),
+                      bootstyle="info", width=15).pack(side=LEFT, padx=(0, 5))
+            ttk.Label(row3, text="(Kod Rujukan / campaign code)",
+                      font=("-size", 10), bootstyle="secondary").pack(side=LEFT)
+
+            # Email row
+            row4 = ttk.Frame(settings_frame)
+            row4.pack(fill=X)
+
+            ttk.Label(row4, text="Notify", font=("-size", 11), width=7).pack(side=LEFT)
             email_var = ttk.StringVar(value=profile_data.get("recipient_email", ""))
-            ttk.Entry(row3, textvariable=email_var, font=("-size", 11),
+            ttk.Entry(row4, textvariable=email_var, font=("-size", 11),
                       bootstyle="info", width=30).pack(side=LEFT, padx=(0, 5))
-            ttk.Label(row3, text="(comma-separated)",
+            ttk.Label(row4, text="(comma-separated)",
                       font=("-size", 10), bootstyle="secondary").pack(side=LEFT)
 
             # Set values: profile override > global default
             prof_bank = profile_data.get('bank_name', default_bank)
             prof_amount = profile_data.get('purchase_amount', default_amount)
+            prof_referral = profile_data.get('referral_code', default_referral)
             prof_funds_str = profile_data.get('funds_to_try', '')
             prof_funds = [f.strip() for f in prof_funds_str.split(',') if f.strip()] if prof_funds_str else default_funds
 
             bank_var.set(prof_bank)
             amount_var.set(prof_amount)
+            referral_var.set(prof_referral)
             for fund, var in fund_vars.items():
-                var.set(fund in prof_funds)
+                var.set(fund_selected_by_config(fund, prof_funds))
+            original_values = {
+                'funds_to_try': ", ".join([f for f, v in fund_vars.items() if v.get()]),
+                'purchase_amount': amount_var.get().strip(),
+                'bank_name': bank_var.get().strip(),
+                'referral_code': referral_var.get().strip(),
+                'recipient_email': email_var.get().strip(),
+            }
 
             # Store vars for saving
             self.tab_vars[profile_key] = {
                 'bank_var': bank_var,
                 'amount_var': amount_var,
+                'referral_var': referral_var,
                 'fund_vars': fund_vars,
                 'email_var': email_var,
+                'default_values': default_values,
+                'profile_keys': profile_keys,
+                'original_values': original_values,
             }
 
             # --- Log area ---
@@ -389,7 +439,7 @@ class ASNBApp:
             ("Profile Name", "name", True),
             ("Username", "username", True),
             ("Password", "password", True),
-            ("Security Phrase", "security_phrase", True),
+            ("Security Phrase", "security_phrase", False),
             ("Recipient Email", "recipient_email", False),
             ("Purchase Amount", "purchase_amount", False),
         ]:
@@ -421,7 +471,7 @@ class ASNBApp:
             if not name:
                 error_var.set("Profile name is required.")
                 return
-            for key in ["username", "password", "security_phrase"]:
+            for key in ["username", "password"]:
                 if not fields[key].get().strip():
                     error_var.set(f"{key.replace('_', ' ').title()} is required.")
                     return
@@ -451,26 +501,52 @@ class ASNBApp:
         """Load is handled during tab creation via profile_data + defaults."""
         pass
 
-    def _save_config(self):
+    def _save_config(self, profile_key=None):
         config = configparser.ConfigParser()
         config.read(CONFIG_FILE)
 
-        for profile_key, vars_dict in self.tab_vars.items():
-            section = f'Profile.{profile_key}'
+        profile_keys = [profile_key] if profile_key else list(self.tab_vars.keys())
+        changed = False
+
+        for current_profile, vars_dict in self.tab_vars.items():
+            if current_profile not in profile_keys:
+                continue
+            section = f'Profile.{current_profile}'
             if section not in config:
                 continue
 
             selected_funds = [f for f, v in vars_dict['fund_vars'].items() if v.get()]
-            config[section]['funds_to_try'] = ", ".join(selected_funds)
-            config[section]['purchase_amount'] = vars_dict['amount_var'].get()
-            config[section]['bank_name'] = vars_dict['bank_var'].get()
-            config[section]['recipient_email'] = vars_dict['email_var'].get().strip()
+            values = {
+                'funds_to_try': ", ".join(selected_funds),
+                'purchase_amount': vars_dict['amount_var'].get().strip(),
+                'bank_name': vars_dict['bank_var'].get().strip(),
+                'referral_code': vars_dict['referral_var'].get().strip(),
+                'recipient_email': vars_dict['email_var'].get().strip(),
+            }
+            default_values = vars_dict.get('default_values', {})
+            profile_options = vars_dict.get('profile_keys', set())
+            original_values = vars_dict.get('original_values', {})
 
-        with open(CONFIG_FILE, 'w') as f:
-            config.write(f)
+            for option, value in values.items():
+                if option in profile_options and value == original_values.get(option):
+                    continue
+                # Do not create profile overrides that only duplicate [Settings] defaults.
+                if option not in profile_options and value == default_values.get(option, ''):
+                    continue
+                if config[section].get(option, '') != value:
+                    config[section][option] = value
+                    changed = True
 
-        for runner in self.runners.values():
-            runner.log("Config saved.")
+        if changed:
+            with open(CONFIG_FILE, 'w') as f:
+                config.write(f)
+            message = "Config saved."
+        else:
+            message = "Config unchanged."
+
+        target_runners = [self.runners[profile_key]] if profile_key else self.runners.values()
+        for runner in target_runners:
+            runner.log(message)
 
     def _start_one(self, profile_key):
         vars_dict = self.tab_vars.get(profile_key, {})
@@ -484,7 +560,7 @@ class ASNBApp:
             self.runners[profile_key].log("Enter an amount.")
             return
 
-        self._save_config()
+        self._save_config(profile_key)
         runner = self.runners[profile_key]
         if not runner.is_running:
             bank = vars_dict.get('bank_var', ttk.StringVar()).get()

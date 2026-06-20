@@ -1,4 +1,4 @@
-.PHONY: help setup run gui stop status logs tail clean
+.PHONY: help setup run gui web stop status logs tail clean
 
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -31,9 +31,16 @@ gui: ## Launch GUI (multi-account)
 	@test -f config.ini || { echo "Error: config.ini not found. Run 'make setup' then edit config.ini."; exit 1; }
 	.venv/bin/python -m asnb.gui
 
+web: ## Launch localhost web UI (optional: HOST=0.0.0.0 PORT=8765)
+	@test -d .venv || { echo "Error: Run 'make setup' first."; exit 1; }
+	@test -f config.ini || { echo "Error: config.ini not found. Run 'make setup' then edit config.ini."; exit 1; }
+	@echo "Open http://$${HOST:-127.0.0.1}:$${PORT:-8765}"
+	.venv/bin/python -m asnb.web --host $${HOST:-127.0.0.1} --port $${PORT:-8765} --open
+
 stop: ## Stop all running instances
 	@pkill -f "asnb.main" 2>/dev/null; \
 	pkill -f "asnb.gui" 2>/dev/null; \
+	pkill -f "asnb.web" 2>/dev/null; \
 	pkill -f chromedriver 2>/dev/null; \
 	pkill -f "chrome_asnb_" 2>/dev/null; \
 	echo "All stopped."

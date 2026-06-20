@@ -40,7 +40,7 @@ This tool sits in the retry loop for you. It logs in, selects your fund, submits
 
 - **Multi-account** -- run multiple MyASNB accounts simultaneously
 - **Smart retry** -- handles "insufficient units" (068) with automatic retry, skips "blocked" (1001) funds
-- **GUI + CLI** -- visual launcher with per-account tabs, or simple `make run P=profile`
+- **Web UI + GUI + CLI** -- localhost dashboard, visual desktop launcher, or simple `make run P=profile`
 - **Per-profile settings** -- different bank, amount, and funds for each account
 - **Email alerts** -- get notified with a screenshot when purchase succeeds
 - **Session management** -- auto-refreshes login to prevent stale data
@@ -63,6 +63,7 @@ make setup                 # creates venv, installs deps, copies config template
 # Edit config.ini -- add your [Profile.xxx] section (see below)
 make run P=yourprofile     # CLI mode
 make gui                   # GUI mode (all profiles)
+make web                   # Localhost web UI, opens browser automatically
 ```
 
 ### Windows
@@ -110,14 +111,31 @@ Each `[Profile.xxx]` section in `config.ini` is one MyASNB account:
 [Profile.ali]
 username = asnb1234              # MyASNB login ID
 password = MyP@ssw0rd            # MyASNB password
-security_phrase = my phrase       # Phrase shown after username entry
+security_phrase = my phrase       # Optional; kept for compatibility
 bank_name = Maybank2U            # FPX bank (see list below)
 purchase_amount = 1000           # RM per attempt
-funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2
+funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2 Wawasan
 recipient_email = ali@gmail.com  # Email notification
 ```
 
 You can have as many profiles as you want. Run them all at once with `make gui` or one at a time with `make run P=ali`.
+
+### Localhost Web UI
+
+Use the browser-based control panel when you want to edit profile settings and run accounts from one place:
+
+```bash
+make web
+```
+
+This opens `http://127.0.0.1:8765` automatically. From there you can update each profile's funds, amount, bank, referral code, and notification email, then save/start/stop/resume runners with live logs.
+
+Optional host/port:
+
+```bash
+PORT=9000 make web
+HOST=0.0.0.0 PORT=8765 make web
+```
 
 ### Global Defaults
 
@@ -125,7 +143,7 @@ You can have as many profiles as you want. Run them all at once with `make gui` 
 
 ```ini
 [Settings]
-funds_to_try = Amanah Saham Malaysia 2
+funds_to_try = Amanah Saham Malaysia 2 Wawasan
 purchase_amount = 100
 bank_name = Public Bank
 loop_tries = 0                   # 0 = infinite retry
@@ -155,6 +173,7 @@ send_on_success = true
 make run P=ali     # Run a specific profile
 make run           # List available profiles
 make gui           # Launch GUI (all profiles)
+make web           # Launch localhost web UI
 make tail          # Live log output
 make stop          # Stop everything
 ```
@@ -176,6 +195,7 @@ asnb/
   email.py      SMTP notifications with screenshot attachments
   actions.py    Human-like browser interactions (typing, clicking, scrolling)
   gui.py        ttkbootstrap GUI with multi-account tabs
+  web.py        Localhost web UI for config edits + live runner control
 ```
 
 ## Troubleshooting
