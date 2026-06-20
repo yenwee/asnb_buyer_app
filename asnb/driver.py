@@ -92,7 +92,6 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
         )
         chrome_options.add_argument("--disable-infobars")
-        
         if browser.lower() == "chrome":
             try:
                 print("Ensuring ChromeDriver is available...")
@@ -111,6 +110,7 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
                     import subprocess as _sp
                     service.creation_flags = _sp.CREATE_NEW_PROCESS_GROUP
                 driver = webdriver.Chrome(service=service, options=chrome_options)
+                driver._asnb_browser_app = "Google Chrome"
                 
                 # Mask navigator.webdriver before any navigation
                 driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
@@ -153,6 +153,7 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
 
                         service = ChromeService(executable_path=executable_path_brave)
                         driver = webdriver.Chrome(service=service, options=chrome_options)
+                        driver._asnb_browser_app = "Brave Browser"
                     else:
                         raise DriverSetupError("Brave Browser not found in default location. Please install Chrome or Brave.") from e
                 else:
@@ -189,4 +190,3 @@ if __name__ == "__main__":
         if driver_instance:
             print("Closing WebDriver.")
             driver_instance.quit()
-

@@ -91,6 +91,34 @@ class PurchaseStats:
 
 stats = PurchaseStats()
 
+def bring_browser_to_front(driver):
+    """Bring browser window to foreground when purchase succeeds."""
+    try:
+        driver.maximize_window()
+        current_os = platform.system()
+        if current_os == "Darwin":
+            app_name = getattr(driver, "_asnb_browser_app", "Google Chrome")
+            subprocess.run(
+                ["osascript", "-e", f'tell application "{app_name}" to activate'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+        elif current_os == "Windows":
+            try:
+                import ctypes
+                ctypes.windll.user32.ShowWindow(
+                    ctypes.windll.user32.GetForegroundWindow(), 9
+                )
+                hwnd = ctypes.windll.user32.FindWindowW(None, driver.title)
+                if hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+            except Exception:
+                pass
+        print("Browser brought to foreground.")
+    except Exception as e:
+        print(f"Could not bring browser to front: {e}")
+
 # --- macOS Desktop Notification ---
 def send_desktop_notification(title, message, sound=True):
     """Send a native macOS notification banner."""
@@ -192,6 +220,232 @@ def wait_for_clickable_element(driver: WebDriver, by: By, value: str, timeout: i
     """Waits for an element to be clickable and returns it."""
     return WebDriverWait(driver, timeout).until(EC.element_to_be_clickable((by, value)))
 
+def wait_for_clickable_any(driver: WebDriver, candidates, timeout: int = WAIT_TIMEOUT, description: str = "element"):
+    """Wait for the first displayed/enabled element from a list of selector candidates."""
+    def find_clickable(d):
+        for label, by, value in candidates:
+            try:
+                for element in d.find_elements(by, value):
+                    if element.is_displayed() and element.is_enabled():
+                        return label, element
+            except WebDriverException:
+                continue
+        return False
+
+    try:
+        return WebDriverWait(driver, timeout).until(find_clickable)
+    except TimeoutException as exc:
+        tried = "; ".join(f"{label}: {value}" for label, _, value in candidates)
+        raise TimeoutException(f"Timed out waiting for {description}. Tried: {tried}") from exc
+
+def normalized_text(value: str) -> str:
+    """Normalize UI text for stable comparisons across whitespace/case changes."""
+    return " ".join((value or "").split()).casefold()
+
+def page_contains_text(driver: WebDriver, expected_text: str) -> bool:
+    """Return whether the current visible page text contains expected_text."""
+    if not expected_text:
+        return True
+    try:
+        page_text = driver.find_element(By.TAG_NAME, "body").text
+    except WebDriverException:
+        return False
+    return normalized_text(expected_text) in normalized_text(page_text)
+
+FUND_NAME_ALIASES = {
+    "Amanah Saham Malaysia 2": [
+        "Amanah Saham Malaysia 2 Wawasan",
+        "Amanah Saham Malaysia 2 - Wawasan",
+        "ASM 2 Wawasan",
+        "ASM 2 - Wawasan",
+        "ASM 2",
+    ],
+    "Amanah Saham Malaysia 2 Wawasan": [
+        "Amanah Saham Malaysia 2",
+        "Amanah Saham Malaysia 2 - Wawasan",
+        "ASM 2 Wawasan",
+        "ASM 2 - Wawasan",
+        "ASM 2",
+    ],
+}
+
+def fund_name_variants(fund_name: str) -> list:
+    """Return portal text aliases for a configured fund name."""
+    variants = []
+    for candidate in [fund_name, *FUND_NAME_ALIASES.get(fund_name, [])]:
+        cleaned = " ".join((candidate or "").split())
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+    lowered = normalized_text(fund_name)
+    if "wawasan" in lowered or "malaysia 2" in lowered or "asm 2" in lowered:
+        for candidate in ["Amanah Saham Malaysia 2", *FUND_NAME_ALIASES["Amanah Saham Malaysia 2"]]:
+            cleaned = " ".join(candidate.split())
+            if cleaned not in variants:
+                variants.append(cleaned)
+    return variants
+
+def find_add_invest_for_fund(driver: WebDriver, fund_name: str, timeout: int = WAIT_TIMEOUT):
+    """Find the Add Invest/Pelaburan Tambahan control for a fund, including aliases."""
+    variants = fund_name_variants(fund_name)
+    print(f"Fund lookup variants: {variants}")
+
+    script = """
+        const variants = arguments[0].map(v => v.toLowerCase().replace(/\\s+/g, ' ').trim());
+        const actionLabels = ['pelaburan tambahan', 'add invest'];
+        const textOf = (el) => (el.innerText || el.textContent || '')
+            .toLowerCase().replace(/\\s+/g, ' ').trim();
+        const actionSelector = 'span, button, a, div';
+        const candidates = Array.from(document.querySelectorAll(actionSelector))
+            .filter(el => actionLabels.some(label => textOf(el).includes(label)));
+
+        for (const candidate of candidates) {
+            let current = candidate;
+            for (let depth = 0; current && depth < 20; depth += 1) {
+                const text = textOf(current);
+                if (variants.some(variant => text.includes(variant))) {
+                    return candidate.closest('button, a') || candidate;
+                }
+                current = current.parentElement;
+            }
+        }
+
+        const fundNodes = Array.from(document.querySelectorAll('span, p, div'))
+            .filter(el => variants.some(variant => textOf(el).includes(variant)));
+        for (const fundNode of fundNodes) {
+            let current = fundNode;
+            for (let depth = 0; current && depth < 20; depth += 1) {
+                const actions = Array.from(current.querySelectorAll(actionSelector))
+                    .filter(el => actionLabels.some(label => textOf(el).includes(label)));
+                if (actions.length > 0) {
+                    return actions[0].closest('button, a') || actions[0];
+                }
+                current = current.parentElement;
+            }
+        }
+        return null;
+    """
+
+    def find_element(d):
+        element = d.execute_script(script, variants)
+        if element and element.is_displayed():
+            return element
+        return False
+
+    return WebDriverWait(driver, timeout).until(find_element)
+
+def select_fixed_price_class_a(driver: WebDriver) -> bool:
+    """Select Kelas A when MyASNB shows the fixed-price fund class modal."""
+    try:
+        body_text = driver.find_element(By.TAG_NAME, "body").text
+    except WebDriverException:
+        return False
+    normalized_body = normalized_text(body_text)
+    if "dana harga tetap" not in normalized_body or "kelas a" not in normalized_body:
+        return False
+
+    print("Fixed-price class modal detected. Selecting Kelas A...")
+    script = """
+        const textOf = (el) => (el.innerText || el.textContent || '')
+            .toLowerCase().replace(/\\s+/g, ' ').trim();
+        const labels = Array.from(document.querySelectorAll('span, p, div, button'))
+            .filter(el => textOf(el) === 'kelas a' || textOf(el).startsWith('kelas a '));
+        for (const label of labels) {
+            let current = label;
+            for (let depth = 0; current && depth < 8; depth += 1) {
+                const text = textOf(current);
+                const style = window.getComputedStyle(current);
+                const clickable = current.tagName === 'BUTTON'
+                    || current.tagName === 'A'
+                    || current.getAttribute('role') === 'button'
+                    || style.cursor === 'pointer'
+                    || typeof current.onclick === 'function';
+                if (text.includes('kelas a') && clickable) {
+                    return current;
+                }
+                current = current.parentElement;
+            }
+        }
+        for (const label of labels) {
+            let current = label;
+            for (let depth = 0; current && depth < 6; depth += 1) {
+                const text = textOf(current);
+                if (text.includes('kelas a') && text.includes('pemegang unit')) {
+                    return current;
+                }
+                current = current.parentElement;
+            }
+        }
+        return null;
+    """
+    try:
+        class_a_element = driver.execute_script(script)
+        if not class_a_element:
+            print("Kelas A option not found in modal.")
+            return False
+        human_scroll_to(driver, class_a_element)
+        human_js_click(driver, class_a_element)
+        print("Kelas A selected.")
+        between_actions()
+        return True
+    except WebDriverException as e:
+        print(f"Failed to select Kelas A: {e}")
+        return False
+
+def detect_and_dismiss_block_popup(driver: WebDriver) -> bool:
+    """Detect and dismiss known navigation-stage block/error popups."""
+    lowercase = "abcdefghijklmnopqrstuvwxyz"
+    uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    block_xpaths = [
+        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'blocked due to too many retry')]" % (uppercase, lowercase),
+        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'blocked due to too many request')]" % (uppercase, lowercase),
+        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'try again in 5 minutes')]" % (uppercase, lowercase),
+        "//*[contains(translate(normalize-space(.), '%s', '%s'), '(1001)')]" % (uppercase, lowercase),
+        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'insufficient units available')]" % (uppercase, lowercase),
+    ]
+
+    for bx in block_xpaths:
+        try:
+            wait_for_element(driver, By.XPATH, bx, timeout=2)
+            print("Block/error popup detected at navigation stage!")
+            dismissed = False
+
+            dismiss_xpaths = [
+                "//button[contains(., 'Close') or contains(., 'Tutup')]",
+                "//button[contains(., 'OK') or contains(., 'Ok')]",
+                "//*[@aria-label='Close' or @aria-label='Tutup' or @title='Close' or @title='Tutup']",
+                "//*[name()='svg' and (contains(@class, 'cursor-pointer') or contains(@class, 'absolute'))]",
+            ]
+            for dismiss_xpath in dismiss_xpaths:
+                try:
+                    button = wait_for_clickable_element(driver, By.XPATH, dismiss_xpath, timeout=2)
+                    try:
+                        button.click()
+                    except WebDriverException:
+                        driver.execute_script(
+                            """
+                            const clickEvent = new MouseEvent('click', {
+                                view: window, bubbles: true, cancelable: true
+                            });
+                            arguments[0].dispatchEvent(clickEvent);
+                            """,
+                            button,
+                        )
+                    print("Dismissed block popup.")
+                    dismissed = True
+                    break
+                except TimeoutException:
+                    continue
+
+            if dismissed:
+                between_actions()
+            else:
+                print("Warning: Popup text matched, but no clickable Close/OK/Tutup/X button was found.")
+            return True
+        except TimeoutException:
+            continue
+
+    return False
+
 # --- Debug Snapshot on Login Failure ---
 DEBUG_DIR = Path("debug_snapshots")
 
@@ -282,7 +536,7 @@ def save_debug_snapshot(driver: WebDriver, reason: str, context: str = "unknown"
 
 # --- Updated Login Function ---
 
-def login(driver: WebDriver, username: str, password: str, security_phrase: str) -> bool: # security_phrase kept for now, though not used in user's flow
+def login(driver: WebDriver, username: str, password: str, security_phrase: str = "") -> bool:
     """
     Attempts to log into the MyASNB website.
 
@@ -290,7 +544,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str)
         driver: The initialized Selenium WebDriver instance.
         username: The user's MyASNB username.
         password: The user's MyASNB password.
-        security_phrase: The user's MyASNB security phrase.
+        security_phrase: Unused; kept for config compatibility.
 
     Returns:
         True if login is successful (or appears successful), False otherwise.
@@ -302,7 +556,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str)
         driver: The initialized Selenium WebDriver instance.
         username: The user's MyASNB username.
         password: The user's MyASNB password.
-        security_phrase: The user's MyASNB security phrase (currently unused in this flow).
+        security_phrase: Unused; kept for config compatibility.
 
     Returns:
         True if login is successful, False otherwise.
@@ -394,15 +648,38 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str)
 
         # 4. Click First Continue Button (Teruskan)
         print("Clicking 'Teruskan' button...")
-        continue_button_1 = wait_for_clickable_element(driver, By.ID, "no-printable")
+        continue_button_candidates = [
+            ("ID - btnContinue", By.ID, "btnContinue"),
+            ("Username form submit", By.XPATH, "//form[.//input[@name='username']]//button[@type='submit']"),
+            ("Malay/English continue text", By.XPATH, "//button[normalize-space()='Teruskan' or normalize-space()='Continue' or .//span[normalize-space()='Teruskan'] or .//span[normalize-space()='Continue']]"),
+        ]
+        selector_name, continue_button_1 = wait_for_clickable_any(
+            driver,
+            continue_button_candidates,
+            timeout=WAIT_TIMEOUT * 2,
+            description="'Teruskan' button",
+        )
+        print(f"Found 'Teruskan' button using: {selector_name}")
         human_click(driver, continue_button_1)
         print("'Teruskan' button clicked.")
 
-        # 5. Click "Yes" Button
-        print("Waiting for and clicking 'Yes' button...")
-        yes_button = wait_for_clickable_element(driver, By.ID, "btnYes")
+        # 5. Verify the security phrase, then click "Yes"/"Ya"
+        print("Waiting for security phrase confirmation...")
+        yes_button_candidates = [
+            ("ID - btnYes", By.ID, "btnYes"),
+            ("Malay/English yes text", By.XPATH, "//button[normalize-space()='Ya' or normalize-space()='Yes' or .//span[normalize-space()='Ya'] or .//span[normalize-space()='Yes']]"),
+        ]
+        selector_name, yes_button = wait_for_clickable_any(
+            driver,
+            yes_button_candidates,
+            timeout=WAIT_TIMEOUT * 2,
+            description="'Yes'/'Ya' confirmation button",
+        )
+        print(f"Found confirmation button using: {selector_name}")
+        print("Skipping security phrase comparison; continuing to password entry.")
+        print("Clicking 'Yes'/'Ya' button...")
         human_click(driver, yes_button)
-        print("'Yes' button clicked.")
+        print("'Yes'/'Ya' button clicked.")
         between_actions()
 
         # 6. Enter Password (human-like typing)
@@ -414,10 +691,18 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str)
 
         # 7. Click Login Button
         print("Clicking 'Login'...")
-        try:
-            login_button = wait_for_clickable_element(driver, By.XPATH, "//button[.//span[text()='Log Masuk']]", timeout=WAIT_TIMEOUT)
-        except TimeoutException:
-            login_button = wait_for_clickable_element(driver, By.XPATH, "//button[.//span[text()='Login']]", timeout=WAIT_TIMEOUT)
+        login_button_candidates = [
+            ("Password form submit", By.XPATH, "//form[.//input[@name='password']]//button[@type='submit']"),
+            ("ID - no-printable", By.ID, "no-printable"),
+            ("Malay/English login text", By.XPATH, "//button[normalize-space()='Log Masuk' or normalize-space()='Login' or .//span[normalize-space()='Log Masuk'] or .//span[normalize-space()='Login']]"),
+        ]
+        selector_name, login_button = wait_for_clickable_any(
+            driver,
+            login_button_candidates,
+            timeout=WAIT_TIMEOUT * 2,
+            description="'Login'/'Log Masuk' button",
+        )
+        print(f"Found 'Login' button using: {selector_name}")
         human_click(driver, login_button)
         print("'Login' button clicked.")
 
@@ -511,14 +796,19 @@ def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
         return False
 
     try:
-        # Use the fund_to_buy variable passed into the function
+        # Use alias-aware lookup first because ASM 2 may be rendered as "ASM 2 Wawasan".
         try:
-            add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Pelaburan Tambahan')]]//span[contains(text(), 'Pelaburan Tambahan')])[1]"
-            add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
-        except:
-            add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Add Invest')]]//span[contains(text(), 'Add Invest')])[1]"
-            add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
-        print(f"Waiting for the presence of the 'Add Invest' span for '{fund_to_buy}' using parent-based XPath: {add_invest_xpath}")
+            add_invest_span = find_add_invest_for_fund(driver, fund_to_buy, timeout=WAIT_TIMEOUT * 2)
+            print(f"Found 'Add Invest' span for '{fund_to_buy}' using alias-aware DOM lookup.")
+        except TimeoutException:
+            print("Alias-aware lookup failed. Trying legacy exact-text XPath lookup...")
+            try:
+                add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Pelaburan Tambahan')]]//span[contains(text(), 'Pelaburan Tambahan')])[1]"
+                add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
+            except Exception:
+                add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Add Invest')]]//span[contains(text(), 'Add Invest')])[1]"
+                add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
+            print(f"Found 'Add Invest' span for '{fund_to_buy}' using legacy XPath: {add_invest_xpath}")
 
         # Scroll element into view, then click with human-like behavior
         try:
@@ -541,29 +831,29 @@ def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
         except TimeoutException:
             print("Amount input not found. Checking for block popup at navigation stage...")
 
-            # Check if a block/error popup appeared instead of the purchase page
-            block_xpaths = [
-                "//p[contains(text(), 'Blocked due to retry') or contains(text(), '(1001)')]",
-                "//p[contains(text(), 'blocked') or contains(text(), 'Blocked')]",
-                "//p[contains(text(), 'insufficient units available')]",
-            ]
-            for bx in block_xpaths:
+            if select_fixed_price_class_a(driver):
                 try:
-                    wait_for_element(driver, By.XPATH, bx, timeout=2)
-                    print(f"Block/error popup detected at navigation stage!")
-                    # Try to dismiss it
-                    try:
-                        ok_btn = wait_for_clickable_element(driver, By.XPATH, "//button[contains(text(), 'OK')]", timeout=3)
-                        ok_btn.click()
-                        print("Dismissed block popup OK button.")
-                        between_actions()
-                    except TimeoutException:
-                        print("No OK button found on block popup.")
-                    return "BLOCKED"
+                    print("Waiting for amount input after selecting Kelas A...")
+                    wait_for_element(driver, By.XPATH, amount_input_xpath, timeout=WAIT_TIMEOUT * 2)
+                    print("Successfully navigated to purchase page after selecting Kelas A.")
+                    return True
                 except TimeoutException:
-                    continue
+                    print("Amount input still not found after selecting Kelas A. Retrying fund action once...")
+                    try:
+                        add_invest_span = find_add_invest_for_fund(driver, fund_to_buy, timeout=WAIT_TIMEOUT)
+                        human_scroll_to(driver, add_invest_span)
+                        human_js_click(driver, add_invest_span)
+                        wait_for_element(driver, By.XPATH, amount_input_xpath, timeout=WAIT_TIMEOUT * 2)
+                        print("Successfully navigated to purchase page after Kelas A retry.")
+                        return True
+                    except Exception as retry_err:
+                        print(f"Kelas A retry did not reach amount input: {retry_err}")
+
+            if detect_and_dismiss_block_popup(driver):
+                return "BLOCKED"
 
             print("No block popup found either. Navigation failed for unknown reason.")
+            save_debug_snapshot(driver, f"Navigation failed after clicking Add Invest for {fund_to_buy}", "navigate_purchase")
             return False
 
     except (TimeoutException, NoSuchElementException) as e:
@@ -712,11 +1002,15 @@ def verify_funds_loaded(driver: WebDriver, expected_funds: list, timeout: int = 
         funds_found = 0
         for fund_name in expected_funds[:3]:  # Check first 3 funds to avoid too many searches
             try:
-                fund_xpath = f"//span[contains(text(), '{fund_name}')]"
-                fund_elements = driver.find_elements(By.XPATH, fund_xpath)
+                fund_elements = []
+                for fund_variant in fund_name_variants(fund_name):
+                    fund_xpath = f"//span[contains(text(), '{fund_variant}')]"
+                    fund_elements = driver.find_elements(By.XPATH, fund_xpath)
+                    if fund_elements:
+                        break
                 if fund_elements:
                     funds_found += 1
-                    print(f"✓ Found fund: {fund_name}")
+                    print(f"✓ Found fund: {fund_name} (matched: {fund_variant})")
             except Exception as e:
                 print(f"⚠️ Error checking fund {fund_name}: {e}")
         
@@ -793,7 +1087,7 @@ def navigate_to_portfolio(driver: WebDriver) -> bool:
 
 
 # --- Modified Purchase Unit Function ---
-def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[str], bank_name: str, email_config: dict = None) -> Union[bool, str]:
+def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[str], bank_name: str, email_config: dict = None, referral_code: str = '') -> Union[bool, str]:
     """
     Executes the purchase of units for a specified fund. Handles retry logic for insufficient units
     and detects the 'Blocked' error. Uses the specified bank name.
@@ -802,6 +1096,7 @@ def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[
         driver: The initialized Selenium WebDriver instance.
         fund_name: The name of the fund being purchased (for logging).
         amount: The amount to invest.
+        referral_code: Optional referral/campaign code (Kod Rujukan) to fill in.
 
     Returns:
         True: If the purchase reaches the final confirmation page.
@@ -858,7 +1153,18 @@ def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[
                 print("Error: Default bank 'Public Bank' also not found. Cannot proceed.")
                 return False # Critical error if default bank isn't there
 
-        # 3. Wait for and click agreement checkbox
+        # 3. Fill referral code if configured
+        if referral_code:
+            print(f"Filling referral code (Kod Rujukan): {referral_code}")
+            try:
+                referral_input = driver.find_element(By.XPATH, "//input[@name='referral']")
+                human_type(referral_input, referral_code)
+                print(f"Referral code '{referral_code}' entered.")
+            except NoSuchElementException:
+                print("Warning: Referral code field (name='referral') not found on page. Skipping.")
+            between_actions()
+
+        # 4. Wait for and click agreement checkbox
         checkbox_xpath = "//input[@type='checkbox' and @value='agree']"
         print(f"Waiting for agreement checkbox: {checkbox_xpath}")
         checkbox = wait_for_clickable_element(driver, By.XPATH, checkbox_xpath)
@@ -914,6 +1220,9 @@ def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[
                 wait_for_element(driver, By.XPATH, final_checkbox_xpath, timeout=7)
                 wait_for_element(driver, By.XPATH, final_button_xpath, timeout=7)
                 print("Successfully reached final payment confirmation page.")
+
+                # Bring browser to foreground for manual payment
+                bring_browser_to_front(driver)
 
                 # Take screenshot for email attachment
                 screenshot_paths = []
@@ -1142,6 +1451,8 @@ def main(profile=None):
 
         amount_to_buy = config.get(prof_section, 'purchase_amount', fallback=amount_to_buy)
         bank_to_use = config.get(prof_section, 'bank_name', fallback=bank_to_use).strip()
+        referral_code = config.get('Settings', 'referral_code', fallback='').strip()
+        referral_code = config.get(prof_section, 'referral_code', fallback=referral_code).strip()
         loop_tries = int(config.get(prof_section, 'loop_tries', fallback=loop_tries))
         session_refresh_interval = int(config.get(prof_section, 'session_refresh_interval', fallback=session_refresh_interval))
 
@@ -1153,7 +1464,8 @@ def main(profile=None):
                 print(f"Using profile-specific email recipients: {', '.join(email_config['recipient_emails'])}")
 
         loop_desc = "infinite" if loop_tries == 0 else str(loop_tries)
-        print(f"Configuration loaded. Funds: {funds_to_try}, Loops: {loop_desc}, Amount: {amount_to_buy}, Bank: {bank_to_use}, Session refresh: {session_refresh_interval} attempts")
+        referral_desc = referral_code if referral_code else "none"
+        print(f"Configuration loaded. Funds: {funds_to_try}, Loops: {loop_desc}, Amount: {amount_to_buy}, Bank: {bank_to_use}, Referral: {referral_desc}, Session refresh: {session_refresh_interval} attempts")
         if email_config:
             recipient_emails = email_config.get('recipient_emails', [])
             if len(recipient_emails) > 1:
@@ -1337,7 +1649,7 @@ def main(profile=None):
                     continue # Try the next fund
 
             # 4b. Attempt Purchase Unit, passing the bank name
-            purchase_status = purchase_unit(driver, current_fund, amount_to_buy, bank_to_use, email_config)
+            purchase_status = purchase_unit(driver, current_fund, amount_to_buy, bank_to_use, email_config, referral_code)
 
             if purchase_status == "RESUME":
                 print(f"Purchase completed for {current_fund}. Resuming with remaining funds...")

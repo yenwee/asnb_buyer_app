@@ -44,8 +44,8 @@ def load_config(config_dir: Path = Path('.'), profile: Optional[str] = None) -> 
         if profile_section not in config:
             raise ConfigError(f"Profile '{profile}' not found. Expected [{profile_section}] section in config file.")
         prof = config[profile_section]
-        if not prof.get('username') or not prof.get('password') or not prof.get('security_phrase'):
-            raise ConfigError(f"Missing username, password, or security_phrase under [{profile_section}].")
+        if not prof.get('username') or not prof.get('password'):
+            raise ConfigError(f"Missing username or password under [{profile_section}].")
 
     return config
 

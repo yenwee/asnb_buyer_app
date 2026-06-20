@@ -4,9 +4,10 @@
 
 [Settings]
 # Global defaults - profiles can override any of these
-funds_to_try = Amanah Saham Malaysia 2
+funds_to_try = Amanah Saham Malaysia 2 Wawasan
 purchase_amount = 100
 bank_name = Public Bank
+referral_code =
 loop_tries = 0
 session_refresh_interval = 6
 
@@ -28,13 +29,12 @@ email_subject = ASNB Purchase Notification
 # Each [Profile.xxx] section is one MyASNB account.
 # Run with: make run P=xxx  or  python -m asnb.main --profile xxx
 #
-# Required: username, password, security_phrase
+# Required: username, password
 #   - username: your MyASNB login ID (e.g. asnb1234)
 #   - password: your MyASNB password
-#   - security_phrase: the phrase shown after entering username
 #
 # Optional overrides (falls back to [Settings] if not set):
-#   bank_name, purchase_amount, funds_to_try,
+#   security_phrase, bank_name, purchase_amount, funds_to_try, referral_code,
 #   loop_tries, session_refresh_interval, recipient_email
 #
 # Available banks:
@@ -50,7 +50,7 @@ password = MyP@ssw0rd123
 security_phrase = my secret phrase
 # bank_name = Maybank2U
 # purchase_amount = 1000
-# funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2
+# funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2 Wawasan
 # recipient_email = ali@gmail.com
 
 # You can add multiple profiles:
