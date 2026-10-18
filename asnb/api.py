@@ -201,7 +201,8 @@ class PortalAPI:
                 elif flag in (0, 4, 5, 6, 7, 8):
                     blocked = bool(re.search('blocked due|too many retr|try again in|1001', reason, re.I))
                     state = {'state': 'BLOCKED' if blocked else 'INACTIVE',
-                             'seconds': block_retry_seconds(reason)}
+                             'seconds': block_retry_seconds(reason),
+                             'reason': 'FUND_BLOCKED' if blocked else 'FUND_INACTIVE'}
             states[name] = state
         self.last_states = states
         # Do not fetch optional metadata when every configured fund is already unavailable.
@@ -213,10 +214,15 @@ class PortalAPI:
             hours = self._get('/v2/getfundbusinesshour/' + self.account, ttl=60).get('data', [])
             if not isinstance(hours, list):
                 raise APIReadError('Operating hours schema changed')
-            closed = (str(maintenance.get('MAINTENANCE_ACTIVE_PORTAL', '')).lower() in ('true', '1', 'yes', 'y')
-                      or (isinstance(settings, dict) and settings.get('subscription_available') is False)
-                      or any(isinstance(h, dict) and _name(h.get('desc')) == 'fixed price'
-                             and str(h.get('status', '')).lower() == 'closed' for h in hours))
+            closed_reason = None
+            if str(maintenance.get('MAINTENANCE_ACTIVE_PORTAL', '')).lower() in ('true', '1', 'yes', 'y'):
+                closed_reason = 'MAINTENANCE'
+            elif isinstance(settings, dict) and settings.get('subscription_available') is False:
+                closed_reason = 'SUBSCRIPTIONS_DISABLED'
+            elif any(isinstance(h, dict) and _name(h.get('desc')) == 'fixed price'
+                     and str(h.get('status', '')).lower() == 'closed' for h in hours):
+                closed_reason = 'OUTSIDE_BUSINESS_HOURS'
+            closed = closed_reason is not None
             banks = self._get('/v2/subscription/fpxbanks', ttl=3600).get('data', [])
             if not isinstance(banks, list):
                 raise APIReadError('Bank metadata schema changed')
@@ -229,7 +235,8 @@ class PortalAPI:
             if closed or bank_closed:
                 for name in states:
                     if states[name]['state'] in ('ELIGIBLE', 'UNKNOWN'):
-                        states[name] = {'state': 'CHANNEL_CLOSED' if closed else 'BANK_UNAVAILABLE', 'seconds': 60}
+                        states[name] = {'state': 'CHANNEL_CLOSED' if closed else 'BANK_UNAVAILABLE',
+                                        'seconds': 60, 'reason': closed_reason if closed else 'BANK_INACTIVE'}
         except (APISessionExpired, APIThrottled):
             raise
         except APIReadError:

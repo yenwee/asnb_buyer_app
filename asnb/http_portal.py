@@ -240,8 +240,10 @@ class HTTPPortal(PortalAPI):
     def purchase_diagnostic(self):
         return json.dumps(self.last_write, separators=(',', ':'))
 
-    def context(self, fund_name, amount, bank_name, fund_aliases=None):
-        fund = self._fund(self.portfolio(force=True), fund_aliases or [fund_name])
+    def context(self, fund_name, amount, bank_name, fund_aliases=None, reuse_preflight=False):
+        # The runner refreshes preflight each turn; reuse its bounded (30s) cache.
+        # Direct callers still force an eligibility read by default.
+        fund = self._fund(self.portfolio(force=not reuse_preflight), fund_aliases or [fund_name])
         if not fund or fund.get('IS_ACTIVE') != 1 or fund.get('IS_FIXED') != 1 or fund.get('FUNDCLASS') != 'A':
             raise APIReadError('Eligible fixed-price Class A fund unavailable')
         banks = self._get('/v2/subscription/fpxbanks', ttl=60).get('data')

@@ -11,22 +11,38 @@ from .http_portal import HTTPPortal
 from .browser_transport import wait_for_portal_ready, sync_cookies
 
 
+def _fund_label(fund):
+    return fund.replace('Amanah Saham Malaysia', 'ASM')
+
+
+def _duration(seconds):
+    minutes, seconds = divmod(math.ceil(seconds), 60)
+    return f'{minutes}:{seconds:02d}'
+
+
+def hold_status(fund, state, remaining):
+    reasons = {
+        'FUND_BLOCKED': 'portal reports fund blocked',
+        'FUND_INACTIVE': 'fund inactive',
+        'MAINTENANCE': 'portal maintenance',
+        'SUBSCRIPTIONS_DISABLED': 'subscriptions disabled',
+        'OUTSIDE_BUSINESS_HOURS': 'outside fund business hours',
+        'BANK_INACTIVE': 'selected bank unavailable',
+    }
+    fallback = {'BLOCKED': 'FUND_BLOCKED', 'INACTIVE': 'FUND_INACTIVE', 'BANK_UNAVAILABLE': 'BANK_INACTIVE'}
+    reason = reasons.get(state.get('reason'), reasons.get(fallback.get(state['state']), 'subscription channel closed'))
+    return f"API eligibility: {_fund_label(fund)}: {state['state']} ({reason}); remaining {_duration(remaining)}."
+
+
 def cooldown_status(funds, tracker):
     """Snapshot per-fund waits and wake no later than the earliest expiry."""
     remaining = {fund: tracker.remaining_cooldown(fund) for fund in funds}
     earliest = min(remaining, key=remaining.get)
     delay = min(60, max(.01, remaining[earliest]))
 
-    def label(fund):
-        return fund.replace('Amanah Saham Malaysia', 'ASM')
-
-    def duration(seconds):
-        minutes, seconds = divmod(math.ceil(seconds), 60)
-        return f'{minutes}:{seconds:02d}'
-
-    counters = ' | '.join(f'{label(fund)}: {duration(seconds)}' for fund, seconds in remaining.items())
-    message = (f'Cooldowns: {counters}. Next eligible: {label(earliest)} in '
-               f'{duration(remaining[earliest])}; status update in {delay:.1f}s.')
+    counters = ' | '.join(f'{_fund_label(fund)}: {_duration(seconds)}' for fund, seconds in remaining.items())
+    message = (f'Cooldowns: {counters}. Next eligible: {_fund_label(earliest)} in '
+               f'{_duration(remaining[earliest])}; status update in {delay:.1f}s.')
     return delay, message
 
 
@@ -40,6 +56,8 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
     browser = None
     snapshot = None
     http_session_bootstrapped = False
+    last_hold_states = {}
+    purchase_attempts = {fund: 0 for fund in funds}
 
     def stop_for_review(message):
         print(message)
@@ -58,6 +76,7 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
     def login():
         nonlocal http_session_bootstrapped
         http_session_bootstrapped = False
+        last_hold_states.clear()
         print(f'HTTP login: subscription transport={subscription_transport}; no purchase-form navigation.')
         try:
             client.login(username, password)
@@ -91,100 +110,108 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                     if state['state'] in ('BLOCKED', 'INACTIVE', 'CHANNEL_CLOSED', 'BANK_UNAVAILABLE'):
                         # A repeated portfolio flag is not a new rejection. Do not
                         # restart another fund's existing countdown on every read.
-                        if not hooks.fund_cooldowns.is_on_cooldown(name):
+                        new_hold = not hooks.fund_cooldowns.is_on_cooldown(name)
+                        if new_hold:
                             hooks.fund_cooldowns.mark_blocked(name, state['seconds'])
+                        signature = (state['state'], state.get('reason'))
+                        if new_hold or last_hold_states.get(name) != signature:
+                            remaining = hooks.fund_cooldowns.remaining_cooldown(name)
+                            print(hold_status(name, state, remaining))
+                        last_hold_states[name] = signature
+                    else:
+                        last_hold_states.pop(name, None)
                 if states.get(fund, {}).get('state') != 'ELIGIBLE':
-                    print(f'API eligibility: {fund}: {states.get(fund, {}).get("state", "UNKNOWN")}; holding for cooldown.')
+                    if fund not in last_hold_states:
+                        print(f'API eligibility: {fund}: {states.get(fund, {}).get("state", "UNKNOWN")}; holding for cooldown.')
                     if not hooks.fund_cooldowns.is_on_cooldown(fund):
                         hooks.fund_cooldowns.mark_blocked(fund, 30)
                     continue
-                if attempts > 1 and (attempts - 1) % refresh_interval == 0:
-                    # Fresh reads keep healthy sessions; only expiry causes re-login.
-                    client.portfolio(force=True)
+                # Preflight already forces a fresh portfolio each fund cycle.
                 try:
                     snapshot = client.snapshot(hooks.fund_name_variants(fund), amount)
                 except APISessionExpired:
                     raise
                 except APIReadError:
                     snapshot = None
-                for retry in range(30):
-                    context = client.context(fund, amount, bank,
-                                             fund_aliases=hooks.fund_name_variants(fund))
-                    if browser is None and (subscription_transport == 'chrome' or not http_session_bootstrapped):
-                        print('Starting Chrome API transport and transferring the authenticated session.')
-                        browser = new_browser()
-                        try:
-                            import_http_session(browser, client)
-                            print('Waiting for the portal application and portfolio initialization before submitting.')
-                            wait_for_portal_ready(browser, client.account)
-                            if subscription_transport == 'http':
-                                sync_cookies(browser, client)
-                                client.driver = None
-                                http_session_bootstrapped = True
-                            else:
-                                client.driver = browser
-                        except Exception:
-                            hooks.close_webdriver(browser)
-                            browser = None
+                context = client.context(fund, amount, bank,
+                                         fund_aliases=hooks.fund_name_variants(fund),
+                                         reuse_preflight=True)
+                if browser is None and (subscription_transport == 'chrome' or not http_session_bootstrapped):
+                    print('Starting Chrome API transport and transferring the authenticated session.')
+                    browser = new_browser()
+                    try:
+                        import_http_session(browser, client)
+                        print('Waiting for the portal application and portfolio initialization before submitting.')
+                        wait_for_portal_ready(browser, client.account)
+                        if subscription_transport == 'http':
+                            sync_cookies(browser, client)
                             client.driver = None
-                            raise
-                        print(f'Portal initialization complete; {subscription_transport} API transport ready.')
-                        try:
-                            browser.minimize_window()
-                        except Exception:
-                            print('Chrome could not minimize; API ordering continues in its portfolio tab.')
-                    print(f'API purchase: {fund}, attempt {retry + 1}/30; waiting up to {purchase_timeout}s for the response.')
-                    outcome = client.purchase(context, referral)
-                    print(f'API response: {outcome}; {client.purchase_diagnostic()}')
-                    if subscription_transport == 'http' and outcome in ('INSUFFICIENT', 'BLOCKED') and browser is not None:
-                        # Only an explicit acknowledgement proves this initialized
-                        # HTTP session is working. Keep cookies in memory afterward.
+                            http_session_bootstrapped = True
+                        else:
+                            client.driver = browser
+                    except Exception:
                         hooks.close_webdriver(browser)
                         browser = None
-                        print('HTTP session acknowledged. Chrome closed; API ordering continues without a browser.')
-                    if outcome == 'INSUFFICIENT':
-                        hooks.stats.record_insufficient()
-                        delay = random.uniform(3, 8)
-                        print(f'Insufficient units (068); retrying in {delay:.1f}s.')
-                        time.sleep(delay)
-                        continue
-                    if outcome == 'BLOCKED':
-                        hooks.stats.record_block(fund)
-                        hooks.fund_cooldowns.mark_blocked(fund, client.block_seconds)
-                        print(f'Fund blocked (1001); cooldown {client.block_seconds}s. Rotating funds.')
-                        break
-                    if outcome != 'SUCCESS':
-                        stop_for_review('Unrecognized purchase outcome.')
-                    # Success remains locked while browser construction/transfer/rendering runs.
-                    try:
-                        print('Subscription accepted. Showing Chrome for manual agreement and FPX.')
-                        if browser is None:
-                            browser = new_browser()
-                        if subscription_transport == 'http':
-                            # Preserve any cookies rotated by the HTTP response.
-                            import_http_session(browser, client)
-                            wait_for_portal_ready(browser, client.account)
-                        try:
-                            browser.maximize_window()
-                        except Exception:
-                            pass
-                        open_confirmation(browser, client.confirmation, client.account)
-                    except KeyboardInterrupt:
+                        client.driver = None
                         raise
+                    print(f'Portal initialization complete; {subscription_transport} API transport ready.')
+                    try:
+                        browser.minimize_window()
                     except Exception:
-                        stop_for_review('Accepted order; Chrome handoff failed. Do not place another order.')
-                    action = hooks.pause_for_payment(browser, fund, amount, email)
-                    if action != 'RESUME':
-                        raise KeyboardInterrupt()
-                    # Resume explicitly follows the user's manual payment/review.
+                        print('Chrome could not minimize; API ordering continues in its portfolio tab.')
+                purchase_attempts[fund] += 1
+                print(f'API purchase: {fund}, attempt {purchase_attempts[fund]}; one attempt per turn; waiting up to {purchase_timeout}s for the response.')
+                outcome = client.purchase(context, referral)
+                print(f'API response: {outcome}; {client.purchase_diagnostic()}')
+                if subscription_transport == 'http' and outcome in ('INSUFFICIENT', 'BLOCKED') and browser is not None:
+                    # Only an explicit acknowledgement proves this initialized
+                    # HTTP session is working. Keep cookies in memory afterward.
                     hooks.close_webdriver(browser)
                     browser = None
-                    client.driver = None
-                    client.logout()
-                    client.submission_locked = False
-                    client.confirmation = None
-                    login()
-                    break
+                    print('HTTP session acknowledged. Chrome closed; API ordering continues without a browser.')
+                if outcome == 'INSUFFICIENT':
+                    hooks.stats.record_insufficient()
+                    delay = random.uniform(3, 8)
+                    print(f'Insufficient units (068); rotating to the next eligible fund after {delay:.1f}s.')
+                    time.sleep(delay)
+                    continue
+                if outcome == 'BLOCKED':
+                    hooks.stats.record_block(fund)
+                    hooks.fund_cooldowns.mark_blocked(fund, client.block_seconds)
+                    print(f'Fund blocked (1001); cooldown {client.block_seconds}s. Rotating funds.')
+                    continue
+                if outcome != 'SUCCESS':
+                    stop_for_review('Unrecognized purchase outcome.')
+                # Success remains locked while browser construction/transfer/rendering runs.
+                try:
+                    print('Subscription accepted. Showing Chrome for manual agreement and FPX.')
+                    if browser is None:
+                        browser = new_browser()
+                    if subscription_transport == 'http':
+                        # Preserve any cookies rotated by the HTTP response.
+                        import_http_session(browser, client)
+                        wait_for_portal_ready(browser, client.account)
+                    try:
+                        browser.maximize_window()
+                    except Exception:
+                        pass
+                    open_confirmation(browser, client.confirmation, client.account)
+                except KeyboardInterrupt:
+                    raise
+                except Exception:
+                    stop_for_review('Accepted order; Chrome handoff failed. Do not place another order.')
+                action = hooks.pause_for_payment(browser, fund, amount, email)
+                if action != 'RESUME':
+                    raise KeyboardInterrupt()
+                # Resume explicitly follows the user's manual payment/review.
+                hooks.close_webdriver(browser)
+                browser = None
+                client.driver = None
+                client.logout()
+                client.submission_locked = False
+                client.confirmation = None
+                login()
+                continue
             except APISessionExpired:
                 if client.submission_locked:
                     stop_for_review('Session changed after dispatch; manual review required.')

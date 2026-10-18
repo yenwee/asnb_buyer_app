@@ -2,6 +2,7 @@ import base64
 import copy
 import json
 import unittest
+from urllib.parse import urlsplit
 from unittest.mock import MagicMock, Mock, patch
 
 import requests
@@ -185,6 +186,46 @@ class HTTPPortalTests(unittest.TestCase):
         self.assertEqual(context['fund_id'], 'ASW')
         self.assertEqual(context['bankid'], 'HLB0224')
         post.assert_not_called()
+
+    def _mock_preflight_reads(self):
+        self.api.account, self.api.authenticated = 'DEMO', True
+        row = {'NAME':'ASM','SHORT_NAME':'ASM','FUNDID':'ASM',
+               'IS_ACTIVE':1,'IS_FIXED':1,'FUNDCLASS':'A'}
+        def response(url, **kwargs):
+            path = urlsplit(url).path
+            if path == '/v2/portfolio/DEMO':
+                return Response({'data':[dict(row)]})
+            if path == '/v2/subscription/fpxbanks':
+                return Response({'data':[{'FPX_BANK_NAME':'Bank','FPX_BANK_CODE':'DUMMY','IS_ACTIVE':1}]})
+            if path == '/v2/getfundbusinesshour/DEMO':
+                return Response({'data':[]})
+            return Response({})
+        self.api.session.get = Mock(side_effect=response)
+        self.api.session.post = Mock()
+        return row
+
+    def test_context_reuses_fresh_preflight_but_rechecks_on_next_attempt(self):
+        self._mock_preflight_reads()
+        self.api.preflight({'ASM':['ASM']}, 'Bank')
+        self.api.context('ASM','5000','Bank',reuse_preflight=True)
+        portfolios = lambda: [call for call in self.api.session.get.call_args_list
+                              if '/v2/portfolio/' in call.args[0]]
+        self.assertEqual(len(portfolios()),1)
+        self.api.context('ASM','5000','Bank')
+        self.assertEqual(len(portfolios()),2)
+        self.api.session.post.assert_not_called()
+
+    def test_expired_preflight_cache_refreshes_and_rejects_newly_inactive_fund(self):
+        row = self._mock_preflight_reads()
+        with patch('asnb.api.time.monotonic',return_value=100):
+            self.api.preflight({'ASM':['ASM']},'Bank')
+        row['IS_ACTIVE'] = 0
+        with patch('asnb.api.time.monotonic',return_value=131):
+            with self.assertRaisesRegex(APIReadError,'Eligible fixed-price'):
+                self.api.context('ASM','5000','Bank',reuse_preflight=True)
+        portfolios = [call for call in self.api.session.get.call_args_list if '/v2/portfolio/' in call.args[0]]
+        self.assertEqual(len(portfolios),2)
+        self.api.session.post.assert_not_called()
 
     def test_purchase_response_timeout_is_longer_than_authentication_timeout(self):
         self.api.account = 'DEMO'

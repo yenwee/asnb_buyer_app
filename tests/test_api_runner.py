@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from asnb.api import APIReadError, APISessionExpired
-from asnb.api_runner import run_http_runner, cooldown_status
+from asnb.api_runner import run_http_runner, cooldown_status, hold_status
 from asnb.handoff import HandoffError
 
 
@@ -22,12 +22,14 @@ class APIRunnerTests(unittest.TestCase):
         self.client.purchase_diagnostic.return_value = '{"http":200}'
         self.hooks = Mock()
         self.hooks.fund_cooldowns.is_on_cooldown.return_value = False
+        self.hooks.fund_cooldowns.remaining_cooldown.return_value = 300
         self.browser_factory = Mock()
 
-    def run_runner(self, subscription_transport='chrome'):
+    def run_runner(self, subscription_transport='chrome', loops=1, funds=None):
+        funds = funds or ['ASM 3']
         if subscription_transport is None:
-            return run_http_runner('demo','private',['ASM 3'],'5000','Hong Leong Bank','',1,6,{},self.browser_factory,self.hooks)
-        return run_http_runner('demo','private',['ASM 3'],'5000','Hong Leong Bank','',1,6,{},self.browser_factory,self.hooks,
+            return run_http_runner('demo','private',funds,'5000','Hong Leong Bank','',loops,6,{},self.browser_factory,self.hooks)
+        return run_http_runner('demo','private',funds,'5000','Hong Leong Bank','',loops,6,{},self.browser_factory,self.hooks,
                                subscription_transport=subscription_transport)
 
     def test_runner_defaults_to_initialized_http(self):
@@ -67,6 +69,26 @@ class APIRunnerTests(unittest.TestCase):
                 patch('asnb.api_runner.import_http_session'):
             self.run_runner()
         self.hooks.fund_cooldowns.mark_blocked.assert_called_once_with('ASM 3',300)
+
+    def test_all_fund_hold_reasons_are_logged_before_any_purchase(self):
+        self.client.preflight.return_value = {
+            'ASM 3':{'state':'BLOCKED','reason':'FUND_BLOCKED','seconds':300},
+            'ASM':{'state':'INACTIVE','reason':'FUND_INACTIVE','seconds':300},
+            'ASM 2':{'state':'BANK_UNAVAILABLE','reason':'BANK_INACTIVE','seconds':60}}
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client):
+            self.run_runner()
+        messages = [call.args[0] for call in self.hooks.print.call_args_list if call.args]
+        self.assertTrue(any('ASM 3: BLOCKED (portal reports fund blocked)' in message for message in messages))
+        self.assertTrue(any('ASM: INACTIVE (fund inactive)' in message for message in messages))
+        self.assertTrue(any('ASM 2: BANK_UNAVAILABLE (selected bank unavailable)' in message for message in messages))
+        self.client.purchase.assert_not_called()
+        self.browser_factory.assert_not_called()
+
+    def test_business_hours_reason_is_static_and_does_not_log_raw_metadata(self):
+        message = hold_status('ASM', {'state':'CHANNEL_CLOSED','reason':'OUTSIDE_BUSINESS_HOURS',
+                                     'private':'private account'}, 60)
+        self.assertIn('outside fund business hours', message)
+        self.assertNotIn('private', message)
 
     def test_http_waits_and_copies_browser_cookies_before_purchase(self):
         events = []
@@ -140,7 +162,7 @@ class APIRunnerTests(unittest.TestCase):
                 patch('asnb.api_runner.sync_cookies') as copy, \
                 patch('asnb.api_runner.open_confirmation'):
             with self.assertRaises(KeyboardInterrupt):
-                self.run_runner('http')
+                self.run_runner('http',loops=2)
         self.assertEqual(events, ['create','INSUFFICIENT','close','SUCCESS','create','close'])
         copy.assert_called_once()
         self.assertEqual(self.client.purchase.call_count, 2)
@@ -150,19 +172,93 @@ class APIRunnerTests(unittest.TestCase):
         with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
                 patch('asnb.api_runner.import_http_session') as transfer, \
                 patch('asnb.api_runner.sync_cookies') as copy:
-            self.run_runner('http')
+            self.run_runner('http',loops=30)
         self.assertEqual(self.client.purchase.call_count, 30)
         self.browser_factory.assert_called_once()
         self.hooks.close_webdriver.assert_called_once()
         transfer.assert_called_once()
         copy.assert_called_once()
+        self.assertTrue(self.client.context.call_args_list[0].kwargs['reuse_preflight'])
+        self.assertTrue(all(call.kwargs['reuse_preflight'] for call in self.client.context.call_args_list))
+        self.assertEqual(self.client.preflight.call_count,30)
+
+    def _configure_round_robin(self):
+        funds = ['ASM','ASM 2','ASM 3']
+        codes = {'ASM':'ASM','ASM 2':'ASW','ASM 3':'AS1M'}
+        self.client.preflight.return_value = {fund:{'state':'ELIGIBLE'} for fund in funds}
+        self.client.context.side_effect = lambda fund,*a,**kw: {'account':'DEMO','fund_id':codes[fund]}
+        return funds
+
+    def test_round_robin_attempts_each_fund_once_before_second_attempt(self):
+        funds = self._configure_round_robin()
+        order = []
+        self.client.purchase.side_effect = lambda context,*a: order.append(context['fund_id']) or 'INSUFFICIENT'
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'), \
+                patch('asnb.api_runner.sync_cookies'), \
+                patch('asnb.api_runner.random.uniform',return_value=5):
+            self.run_runner('http',loops=2,funds=funds)
+        self.assertEqual(order,['ASM','ASW','AS1M','ASM','ASW','AS1M'])
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list],[5]*6)
+        self.browser_factory.assert_called_once()
+
+    def test_round_robin_skips_blocked_fund_on_later_turns(self):
+        funds = self._configure_round_robin()
+        blocked, order = set(), []
+        self.hooks.fund_cooldowns.is_on_cooldown.side_effect = lambda fund: fund in blocked
+        self.hooks.fund_cooldowns.mark_blocked.side_effect = lambda fund,*a: blocked.add(fund)
+        self.client.block_seconds = 300
+        def outcome(context,*args):
+            order.append(context['fund_id'])
+            return 'BLOCKED' if context['fund_id']=='ASM' else 'INSUFFICIENT'
+        self.client.purchase.side_effect = outcome
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'), \
+                patch('asnb.api_runner.sync_cookies'):
+            self.run_runner('http',loops=2,funds=funds)
+        self.assertEqual(order,['ASM','ASW','AS1M','ASW','AS1M','ASW'])
+        self.hooks.fund_cooldowns.mark_blocked.assert_called_once_with('ASM',300)
+
+    def test_unknown_response_stops_round_robin_before_next_fund(self):
+        funds = self._configure_round_robin()
+        order = []
+        def outcome(context,*args):
+            order.append(context['fund_id'])
+            if context['fund_id']=='ASW':
+                self.client.submission_locked = True
+                raise HandoffError('uncertain')
+            return 'INSUFFICIENT'
+        self.client.purchase.side_effect = outcome
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'), \
+                patch('asnb.api_runner.sync_cookies'):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_runner('http',loops=2,funds=funds)
+        self.assertEqual(order,['ASM','ASW'])
+        self.hooks.wait_for_submission_review.assert_called_once()
+
+    def test_acceptance_pauses_round_robin_before_next_fund(self):
+        funds = self._configure_round_robin()
+        def accepted(*args):
+            self.client.submission_locked=True
+            return 'SUCCESS'
+        self.client.purchase.side_effect=accepted
+        self.hooks.pause_for_payment.side_effect=KeyboardInterrupt
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'), \
+                patch('asnb.api_runner.sync_cookies'), \
+                patch('asnb.api_runner.open_confirmation'):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_runner('http',loops=2,funds=funds)
+        self.client.purchase.assert_called_once()
+        self.assertEqual(self.client.purchase.call_args.args[0]['fund_id'],'ASM')
 
 
     def test_rejected_attempts_reuse_one_chrome_transport(self):
         self.client.purchase.return_value = 'INSUFFICIENT'
         with patch('asnb.api_runner.HTTPPortal',return_value=self.client), patch('asnb.api_runner.time.sleep'), \
                 patch('asnb.api_runner.import_http_session') as transfer:
-            self.run_runner()
+            self.run_runner(loops=30)
         self.assertEqual(self.client.purchase.call_count,30)
         self.browser_factory.assert_called_once()
         transfer.assert_called_once()

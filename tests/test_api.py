@@ -116,6 +116,23 @@ class APITests(unittest.TestCase):
             self.assertEqual(states['ASM']['state'], expected)
             self.assertEqual(states['ASM2']['state'], 'BLOCKED')
 
+    def test_preflight_reports_static_reasons_for_each_channel_hold(self):
+        cases = [({'MAINTENANCE_ACTIVE_PORTAL':True}, {}, [], 1, 'MAINTENANCE'),
+                 ({}, {'subscription_available':False}, [], 1, 'SUBSCRIPTIONS_DISABLED'),
+                 ({}, {}, [{'desc':'Fixed Price','status':'Closed'}], 1, 'OUTSIDE_BUSINESS_HOURS'),
+                 ({}, {}, [], 0, 'BANK_INACTIVE')]
+        self.api.account = 'owned'
+        for maintenance, settings, hours, bank_active, reason in cases:
+            data = {'/maintenance':maintenance, '/v2/settings':{'data':settings},
+                    '/v2/getfundbusinesshour/owned':{'data':hours},
+                    '/v2/subscription/fpxbanks':{'data':[{'FULL_NAME':'Bank','IS_ACTIVE':bank_active}]}}
+            with self.subTest(reason=reason), \
+                    patch.object(self.api,'portfolio',return_value=[{'NAME':'ASM','IS_ACTIVE':1}]), \
+                    patch.object(self.api,'_get',side_effect=lambda path, **kw:data[path]):
+                state = self.api.preflight({'ASM':['ASM']},'Bank')['ASM']
+            self.assertEqual(state['reason'],reason)
+            self.assertEqual(state['seconds'],60)
+
     def test_class_b_and_ambiguous_names_do_not_authorize_class_a(self):
         self.assertIsNone(self.api._fund([{'NAME': 'ASM', 'FUNDCLASS': 'B'}], ['ASM']))
         self.assertIsNone(self.api._fund([{'NAME': 'ASM'}, {'NAME': 'ASM'}], ['ASM']))

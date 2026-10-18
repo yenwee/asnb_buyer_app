@@ -100,7 +100,9 @@ api_reads = true
 api_purchase_timeout_seconds = 60
 ```
 
-`purchase_amount` is RM per attempt; `loop_tries = 0` runs continuously.
+`purchase_amount` is RM per attempt; `loop_tries = 0` runs continuously. In API
+mode, a positive value caps fund turns at that value times the configured fund
+count; skipped cooldowns do not consume a turn.
 Fund codes resolve from portfolio metadata: ASM → `ASM`, ASM 2 Wawasan → `ASW`,
 ASM 3 → `AS1M`. Holdings printed after login are current investments, not a bank
 balance or a count of units available to buy.
@@ -153,14 +155,21 @@ are copied back to HTTP. After the first explicit `068`/`1001` rejection, Chrome
 closes; later HTTP attempts reuse the session without reopening it. Session expiry
 starts a fresh login/initialization cycle.
 
-`068` retries up to 30 times per fund cycle with a 3–8 second delay. `1001` applies
-the server-directed cooldown and rotates funds. Initial investment terms remain
+API mode attempts one eligible fund per turn in configured order, then repeats.
+After `068`, it waits 3–8 seconds and moves to the next eligible fund rather than
+exhausting a retry batch on one fund. `1001` applies the server-directed cooldown
+and rotates funds. Initial investment terms remain
 accepted in the API payload, preserving the original automated flow.
 
 When all funds are cooling down, logs show each remaining countdown and the next
 eligible fund. Status updates occur at most 60 seconds apart, with an earlier
 wake when the first cooldown expires. Repeated portfolio reads preserve existing
 countdowns; a new explicit block starts a fresh server-directed wait.
+When a hold starts or its reason changes, logs identify every affected fund and
+distinguish fund blocks/inactivity, maintenance, business hours, disabled
+subscriptions and bank availability. Every turn fetches fresh preflight eligibility;
+purchase context reuses that response while it is under 30 seconds old. An expired
+cached response is refreshed before use.
 
 On acceptance, Chrome opens or is reused with the current session and navigates
 to the final agreement page. Its final checkbox stays unchecked and payment stays
