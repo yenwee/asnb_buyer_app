@@ -1,6 +1,7 @@
 """HTTP-first ordering with temporary Chrome session initialization."""
 
 import itertools
+import math
 import random
 import time
 
@@ -8,6 +9,25 @@ from .api import APIReadError, APISessionExpired, APIThrottled
 from .handoff import HandoffError, import_http_session, open_confirmation
 from .http_portal import HTTPPortal
 from .browser_transport import wait_for_portal_ready, sync_cookies
+
+
+def cooldown_status(funds, tracker):
+    """Snapshot per-fund waits and wake no later than the earliest expiry."""
+    remaining = {fund: tracker.remaining_cooldown(fund) for fund in funds}
+    earliest = min(remaining, key=remaining.get)
+    delay = min(60, max(.01, remaining[earliest]))
+
+    def label(fund):
+        return fund.replace('Amanah Saham Malaysia', 'ASM')
+
+    def duration(seconds):
+        minutes, seconds = divmod(math.ceil(seconds), 60)
+        return f'{minutes}:{seconds:02d}'
+
+    counters = ' | '.join(f'{label(fund)}: {duration(seconds)}' for fund, seconds in remaining.items())
+    message = (f'Cooldowns: {counters}. Next eligible: {label(earliest)} in '
+               f'{duration(remaining[earliest])}; status update in {delay:.1f}s.')
+    return delay, message
 
 
 def run_http_runner(username, password, funds, amount, bank, referral, loops,
@@ -58,9 +78,9 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                 break
             if hooks.fund_cooldowns.is_on_cooldown(fund):
                 if all(hooks.fund_cooldowns.is_on_cooldown(f) for f in funds):
-                    delay = min(hooks.fund_cooldowns.remaining_cooldown(f) for f in funds)
-                    print(f'All configured funds are on cooldown; next check in {min(60, max(.25, delay)):.0f}s.')
-                    time.sleep(min(60, max(.25, delay)))
+                    delay, message = cooldown_status(funds, hooks.fund_cooldowns)
+                    print(message)
+                    time.sleep(delay)
                 continue
             attempts += 1
             hooks.stats.record_attempt(fund)
@@ -69,7 +89,10 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                 states = client.preflight({f: hooks.fund_name_variants(f) for f in funds}, bank)
                 for name, state in states.items():
                     if state['state'] in ('BLOCKED', 'INACTIVE', 'CHANNEL_CLOSED', 'BANK_UNAVAILABLE'):
-                        hooks.fund_cooldowns.mark_blocked(name, state['seconds'])
+                        # A repeated portfolio flag is not a new rejection. Do not
+                        # restart another fund's existing countdown on every read.
+                        if not hooks.fund_cooldowns.is_on_cooldown(name):
+                            hooks.fund_cooldowns.mark_blocked(name, state['seconds'])
                 if states.get(fund, {}).get('state') != 'ELIGIBLE':
                     print(f'API eligibility: {fund}: {states.get(fund, {}).get("state", "UNKNOWN")}; holding for cooldown.')
                     if not hooks.fund_cooldowns.is_on_cooldown(fund):

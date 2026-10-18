@@ -157,6 +157,11 @@ starts a fresh login/initialization cycle.
 the server-directed cooldown and rotates funds. Initial investment terms remain
 accepted in the API payload, preserving the original automated flow.
 
+When all funds are cooling down, logs show each remaining countdown and the next
+eligible fund. Status updates occur at most 60 seconds apart, with an earlier
+wake when the first cooldown expires. Repeated portfolio reads preserve existing
+countdowns; a new explicit block starts a fresh server-directed wait.
+
 On acceptance, Chrome opens or is reused with the current session and navigates
 to the final agreement page. Its final checkbox stays unchecked and payment stays
 disabled until you accept manually. After payment/review, Enter resumes the runner;

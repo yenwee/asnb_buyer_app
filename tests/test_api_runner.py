@@ -2,7 +2,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from asnb.api import APIReadError, APISessionExpired
-from asnb.api_runner import run_http_runner
+from asnb.api_runner import run_http_runner, cooldown_status
 from asnb.handoff import HandoffError
 
 
@@ -41,6 +41,32 @@ class APIRunnerTests(unittest.TestCase):
         copy.assert_called_once()
         self.browser_factory.assert_called_once()
         self.hooks.close_webdriver.assert_called_once()
+
+    def test_cooldown_snapshot_wakes_for_first_expiry_and_shows_each_fund(self):
+        tracker = Mock()
+        tracker.remaining_cooldown.side_effect = lambda fund: {'ASM':150,'ASM 2':12.2,'ASM 3':90}[fund]
+        delay, message = cooldown_status(['ASM','ASM 2','ASM 3'], tracker)
+        self.assertEqual(delay, 12.2)
+        self.assertIn('ASM: 2:30 | ASM 2: 0:13 | ASM 3: 1:30', message)
+        self.assertIn('Next eligible: ASM 2 in 0:13', message)
+
+    def test_long_cooldowns_keep_status_updates_bounded_to_one_minute(self):
+        tracker = Mock()
+        tracker.remaining_cooldown.side_effect = lambda fund: {'ASM':180,'ASM 2':120}[fund]
+        delay, message = cooldown_status(['ASM','ASM 2'], tracker)
+        self.assertEqual(delay, 60)
+        self.assertIn('Next eligible: ASM 2 in 2:00', message)
+
+    def test_preflight_does_not_restart_another_funds_active_cooldown(self):
+        self.hooks.fund_cooldowns.is_on_cooldown.side_effect = lambda fund: fund == 'ASM 2'
+        self.client.preflight.return_value = {
+            'ASM 3':{'state':'ELIGIBLE'}, 'ASM 2':{'state':'BLOCKED','seconds':300}}
+        self.client.purchase.return_value = 'BLOCKED'
+        self.client.block_seconds = 300
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'):
+            self.run_runner()
+        self.hooks.fund_cooldowns.mark_blocked.assert_called_once_with('ASM 3',300)
 
     def test_http_waits_and_copies_browser_cookies_before_purchase(self):
         events = []
