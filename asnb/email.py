@@ -17,7 +17,8 @@ def send_purchase_notification(
     fund_name: Optional[str] = None,
     amount: Optional[str] = None,
     error_message: Optional[str] = None,
-    screenshot_paths: Optional[List[str]] = None
+    screenshot_paths: Optional[List[str]] = None,
+    test: bool = False,
 ) -> bool:
     """
     Sends an email notification about ASNB purchase attempt.
@@ -38,14 +39,15 @@ def send_purchase_notification(
         return False
     
     # Check if we should send email based on success/failure settings
-    if success and not email_config.get('send_on_success', True):
+    if not test and success and not email_config.get('send_on_success', True):
         print("Success email notifications disabled.")
         return False
     
-    if not success and not email_config.get('send_on_failure', False):
+    if not test and not success and not email_config.get('send_on_failure', False):
         print("Failure email notifications disabled.")
         return False
     
+    stage = 'message preparation'
     try:
         # Handle multiple recipients
         recipient_emails = email_config.get('recipient_emails', [])
@@ -182,6 +184,15 @@ This is an automated notification from your ASNB Buyer script.
 </html>
 """
         
+        if test:
+            subject_status = "TEST"
+            text_content = (
+                "ASNB Buyer email test\n\n"
+                f"Time: {timestamp}\n\n"
+                "This is a test notification. No purchase was attempted.\n"
+            )
+            html_content = '<html><body><pre>' + text_content + '</pre></body></html>'
+
         # Update subject with status (must delete first to avoid duplicate headers)
         base_subject = message["Subject"]
         del message["Subject"]
@@ -231,10 +242,18 @@ This is an automated notification from your ASNB Buyer script.
         context = ssl.create_default_context()
         
         # Connect to server and send email
-        with smtplib.SMTP(email_config['smtp_server'], email_config['smtp_port']) as server:
-            # Enable debug output from SMTP
-            server.set_debuglevel(1)
-            server.starttls(context=context)
+        port = int(email_config['smtp_port'])
+        smtp_class = smtplib.SMTP_SSL if port == 465 else smtplib.SMTP
+        connection_options = {'timeout': 30}
+        if port == 465:
+            connection_options['context'] = context
+        stage = 'SMTP connection'
+        with smtp_class(email_config['smtp_server'], port, **connection_options) as server:
+            # SMTP protocol debugging can expose encoded authentication secrets.
+            if port != 465:
+                stage = 'STARTTLS'
+                server.starttls(context=context)
+            stage = 'SMTP authentication'
             server.login(email_config['sender_email'], email_config['sender_password'])
             
             # Debug: Verify what we're passing to sendmail
@@ -244,6 +263,7 @@ This is an automated notification from your ASNB Buyer script.
             
             # Send email and capture any rejection info
             try:
+                stage = 'message submission'
                 refused = server.sendmail(
                     email_config['sender_email'],
                     recipient_emails,  # Pass list of recipients
@@ -251,6 +271,7 @@ This is an automated notification from your ASNB Buyer script.
                 )
                 if refused:
                     print(f"WARNING: Some recipients were refused by server: {refused}")
+                    return False
                 else:
                     print(f"DEBUG: All {len(recipient_emails)} recipients accepted by SMTP server")
                     
@@ -265,7 +286,7 @@ This is an automated notification from your ASNB Buyer script.
         return True
         
     except Exception as e:
-        print(f"❌ Failed to send email notification: {e}")
+        print(f"❌ Failed to send email notification during {stage}: {e}")
         return False
 
 def test_email_config(email_config: Dict[str, Any]) -> bool:
@@ -288,7 +309,8 @@ def test_email_config(email_config: Dict[str, Any]) -> bool:
         success=True,
         fund_name="Test Fund",
         amount="100",
-        error_message=None
+        error_message=None,
+        test=True,
     )
 
 # Example usage (for testing)

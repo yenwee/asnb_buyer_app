@@ -40,6 +40,7 @@ def setup_logging(profile: Optional[str] = None):
     global _file_handler
     if _file_handler:
         logger.removeHandler(_file_handler)
+        _file_handler.close()
     suffix = f"_{profile}" if profile else ""
     log_file = LOG_DIR / f"asnb_buyer{suffix}_{datetime.now().strftime('%Y%m%d')}.log"
     _file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
@@ -125,77 +126,216 @@ def send_desktop_notification(title, message, sound=True):
     if platform.system() != "Darwin":
         return
     try:
-        sound_flag = 'with sound "Glass"' if sound else ""
-        escaped_msg = message.replace('"', '\\"').replace("'", "\\'")
-        escaped_title = title.replace('"', '\\"')
-        os.system(f'''osascript -e 'display notification "{escaped_msg}" with title "{escaped_title}" {sound_flag}' ''')
+        def literal(value):
+            return '"' + str(value).replace('\\', '\\\\').replace('"', '\\"').replace('\n', ' ').replace('\r', ' ') + '"'
+        sound_flag = ' sound name "Glass"' if sound else ''
+        script = f'display notification {literal(message)} with title {literal(title)}{sound_flag}'
+        result = subprocess.run(['osascript', '-e', script], capture_output=True, text=True,
+                                timeout=5, check=False)
+        if result.returncode:
+            print('Desktop notification unavailable; runner status remains in the log.')
     except Exception as e:
         print(f"Desktop notification failed: {e}")
 
 # --- Block Cooldown Tracking ---
 class FundCooldownTracker:
     """Skip recently-blocked funds for a cooldown period to avoid wasting attempts."""
-    COOLDOWN_SECONDS = 120  # Skip blocked funds for 2 minutes
+    COOLDOWN_SECONDS = 300  # Portal currently requests five minutes.
 
     def __init__(self):
-        self._blocked_at = {}  # fund_name -> datetime
+        self._blocked_at = {}  # fund_name -> monotonic timestamp
+        self._cooldown_seconds = {}
 
-    def mark_blocked(self, fund_name):
-        self._blocked_at[fund_name] = datetime.now()
+    def mark_blocked(self, fund_name, seconds=None):
+        self._blocked_at[fund_name] = time.monotonic()
+        self._cooldown_seconds[fund_name] = seconds if isinstance(seconds, (int, float)) and seconds > 0 else self.COOLDOWN_SECONDS
 
     def is_on_cooldown(self, fund_name):
         if fund_name not in self._blocked_at:
             return False
-        elapsed = (datetime.now() - self._blocked_at[fund_name]).total_seconds()
-        if elapsed >= self.COOLDOWN_SECONDS:
+        elapsed = time.monotonic() - self._blocked_at[fund_name]
+        if elapsed >= self._cooldown_seconds[fund_name]:
             del self._blocked_at[fund_name]
+            del self._cooldown_seconds[fund_name]
             return False
         return True
 
     def remaining_cooldown(self, fund_name):
         if fund_name not in self._blocked_at:
             return 0
-        elapsed = (datetime.now() - self._blocked_at[fund_name]).total_seconds()
-        return max(0, self.COOLDOWN_SECONDS - elapsed)
+        elapsed = time.monotonic() - self._blocked_at[fund_name]
+        return max(0, self._cooldown_seconds[fund_name] - elapsed)
 
 fund_cooldowns = FundCooldownTracker()
 
 # --- Periodic Summary Notification ---
 SUMMARY_INTERVAL_SECONDS = 3600  # Send summary every hour
-_last_summary_time = datetime.now()
+_last_summary_time = time.monotonic()
+_summary_thread = None
+
 
 def maybe_send_summary_email(email_config):
-    """Send periodic summary email if enough time has passed."""
-    global _last_summary_time
-    elapsed = (datetime.now() - _last_summary_time).total_seconds()
-    if elapsed < SUMMARY_INTERVAL_SECONDS or not email_config:
+    """Send at most one summary in the background, without holding up purchases."""
+    global _last_summary_time, _summary_thread
+    if not email_config or time.monotonic() - _last_summary_time < SUMMARY_INTERVAL_SECONDS:
         return
-    _last_summary_time = datetime.now()
+    if _summary_thread is not None and _summary_thread.is_alive():
+        return
+    summary_text = stats.summary()
+    summary_config = dict(email_config)
+    summary_config['send_on_failure'] = True
+
+    def send_summary():
+        try:
+            sent = send_purchase_notification(
+                email_config=summary_config,
+                success=False,
+                fund_name="Periodic Status Update",
+                amount="N/A",
+                error_message=f"Script is still running.{summary_text}",
+            )
+            print("Periodic summary email sent." if sent else "Periodic summary email failed.")
+        except Exception as e:
+            print(f"Failed to send summary email: {e}")
+
+    _summary_thread = threading.Thread(target=send_summary, name="summary-email", daemon=True)
+    _summary_thread.start()
+    _last_summary_time = time.monotonic()
+
+_success_email_thread = None
+
+
+def send_success_email_async(email_config, fund_name, amount, screenshot_paths):
+    global _success_email_thread
+    if _success_email_thread is not None and _success_email_thread.is_alive():
+        print("Previous success email still sending; desktop notification remains active.")
+        return
+    def send():
+        try:
+            sent = send_purchase_notification(dict(email_config), success=True,
+                fund_name=fund_name, amount=amount, screenshot_paths=list(screenshot_paths))
+            print("Success email accepted by SMTP." if sent else "Success email failed; complete payment in browser.")
+        except Exception:
+            print("Success email failed; complete payment in browser.")
+    _success_email_thread = threading.Thread(target=send, name="success-email", daemon=True)
+    _success_email_thread.start()
+
+
+def mark_fund_ui_stale(driver, fund):
+    stale_funds = getattr(driver, '_asnb_stale_funds', None)
+    if not isinstance(stale_funds, set):
+        stale_funds = set()
+        driver._asnb_stale_funds = stale_funds
+    stale_funds.add(fund)
+
+
+def api_preflight(driver, current_fund, funds, bank):
+    """Skip known restrictions using one fresh portfolio read; preserve UI fallback."""
+    client = get_api(driver)
+    if client is None:
+        return 'UI'
     try:
-        summary_text = stats.summary()
-        # Use a copy with send_on_failure forced true so periodic summaries always send
-        summary_config = dict(email_config)
-        summary_config['send_on_failure'] = True
-        send_purchase_notification(
-            email_config=summary_config,
-            success=False,
-            fund_name="Periodic Status Update",
-            amount="N/A",
-            error_message=f"Script is still running.{summary_text}"
-        )
-        print("Periodic summary email sent.")
-    except Exception as e:
-        print(f"Failed to send summary email: {e}")
+        states = client.preflight({f: fund_name_variants(f) for f in funds}, bank)
+    except APISessionExpired:
+        print("API session expired; login recovery required.")
+        return 'SESSION_EXPIRED'
+    except APIThrottled as error:
+        for fund in funds:
+            if not fund_cooldowns.is_on_cooldown(fund):
+                fund_cooldowns.mark_blocked(fund, error.seconds)
+        print(f"API transport throttled; pausing all funds for {error.seconds}s.")
+        return 'SKIP'
+    except APIReadError:
+        if not getattr(client, '_fallback_logged', False):
+            print("API read unavailable; using normal UI checks.")
+            client._fallback_logged = True
+        return 'UI'
+    client._fallback_logged = False
+    stale_funds = getattr(driver, '_asnb_stale_funds', None)
+    if not isinstance(stale_funds, set):
+        stale_funds = set()
+        driver._asnb_stale_funds = stale_funds
+    for fund, state in states.items():
+        if state['state'] in ('BLOCKED', 'INACTIVE', 'CHANNEL_CLOSED', 'BANK_UNAVAILABLE'):
+            if not fund_cooldowns.is_on_cooldown(fund):
+                fund_cooldowns.mark_blocked(fund, state['seconds'])
+                if state['state'] == 'BLOCKED':
+                    stats.record_block(fund)
+                print(f"API eligibility: {fund}: {state['state']}; wait {state['seconds']}s; no fund click.")
+            stale_funds.add(fund)
+    state = states.get(current_fund, {}).get('state')
+    if state in ('BLOCKED', 'INACTIVE', 'CHANNEL_CLOSED', 'BANK_UNAVAILABLE'):
+        return 'SKIP'
+    if state == 'ELIGIBLE' and current_fund in stale_funds:
+        driver._asnb_portfolio_refresh_needed = True
+    return 'READY' if state == 'ELIGIBLE' else 'UI'
+
+
+def refresh_portfolio_ui(driver, fund):
+    """Keep the session alive when portfolio rendering is temporarily slow."""
+    try:
+        print("Refreshing portfolio UI after fund eligibility recovery.")
+        driver.refresh()
+        WebDriverWait(driver, 15).until(
+            lambda d: find_fund_action(d, fund_name_variants(fund)))
+    except (TimeoutException, WebDriverException):
+        print("Portfolio refresh not ready; keeping browser session and waiting 30s before retry.")
+        fund_cooldowns.mark_blocked(fund, 30)
+        return False
+    driver._asnb_portfolio_refresh_needed = False
+    stale_funds = getattr(driver, '_asnb_stale_funds', None)
+    if isinstance(stale_funds, set):
+        stale_funds.clear()  # A successful page refresh replaces every fund's cached UI.
+    return True
+
+
+def reconcile_submission(driver):
+    client = get_api(driver)
+    snapshot = getattr(driver, '_asnb_submission_snapshot', None)
+    if client is None or not isinstance(snapshot, dict):
+        print("API transaction reconciliation unavailable; review in browser.")
+        return
+    try:
+        print("API transaction history:", client.reconcile(snapshot))
+    except APIReadError:
+        print("API transaction reconciliation unavailable; review in browser.")
+
+
+def wait_for_submission_review(driver):
+    print("Submission outcome unknown. Check transaction history and any pending payment in the browser.")
+    print("Resume only after completing/cancelling any pending transaction and confirming its outcome.")
+    send_desktop_notification("ASNB - Review required", "Submission outcome unknown. Check browser before resuming.")
+    print("[REVIEW_REQUIRED]")
+    done, eof = threading.Event(), threading.Event()
+    def read_acknowledgement():
+        try:
+            input("Press ENTER / Resume after reviewing, or Ctrl+C to stop: ")
+        except EOFError:
+            eof.set()
+        finally:
+            done.set()
+    threading.Thread(target=read_acknowledgement, name="submission-review", daemon=True).start()
+    while not done.wait(timeout=1):
+        trace_network(driver)
+    if eof.is_set():
+        raise KeyboardInterrupt()
 
 from selenium.webdriver.remote.webdriver import WebDriver
 from selenium.common.exceptions import WebDriverException, TimeoutException, NoSuchElementException
+from .popups import dismiss_login_popups
+from .purchase_state import find_fund_action, wait_purchase_state
+from .health import BrowserHealth
+from .api import PortalAPI, APIReadError, APISessionExpired, APIThrottled, get_api
+from .network import trace_network, network_summary
+from .purchase_state import submit_and_observe, block_retry_seconds
+import hashlib
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait, Select
 from selenium.webdriver.support import expected_conditions as EC
 
 try:
     from asnb.config import load_config, get_funds_list, get_email_config, get_session_refresh_interval, get_profile_names, ConfigError
-    from asnb.driver import get_webdriver, DriverSetupError
+    from asnb.driver import get_webdriver, close_webdriver, DriverSetupError
     from asnb.email import send_purchase_notification, EmailNotificationError
     from asnb.actions import human_type, human_click, human_js_click, human_delay, human_scroll_to, between_actions, after_page_load
 except ImportError as e:
@@ -204,6 +344,7 @@ except ImportError as e:
     sys.exit(1)
 
 # --- Constants ---
+DEFAULT_PURCHASE_TRANSPORT = 'api'
 # MYASNB_URL = "https://www.myasnb.com.my/" # Original URL, user specified login page
 MYASNB_LOGIN_URL = "https://www.myasnb.com.my/login"
 MYASNB_PORTFOLIO_URL = "https://www.myasnb.com.my/portfolio"
@@ -223,6 +364,7 @@ def wait_for_clickable_element(driver: WebDriver, by: By, value: str, timeout: i
 def wait_for_clickable_any(driver: WebDriver, candidates, timeout: int = WAIT_TIMEOUT, description: str = "element"):
     """Wait for the first displayed/enabled element from a list of selector candidates."""
     def find_clickable(d):
+        trace_network(d)
         for label, by, value in candidates:
             try:
                 for element in d.find_elements(by, value):
@@ -289,49 +431,8 @@ def find_add_invest_for_fund(driver: WebDriver, fund_name: str, timeout: int = W
     variants = fund_name_variants(fund_name)
     print(f"Fund lookup variants: {variants}")
 
-    script = """
-        const variants = arguments[0].map(v => v.toLowerCase().replace(/\\s+/g, ' ').trim());
-        const actionLabels = ['pelaburan tambahan', 'add invest'];
-        const textOf = (el) => (el.innerText || el.textContent || '')
-            .toLowerCase().replace(/\\s+/g, ' ').trim();
-        const actionSelector = 'span, button, a, div';
-        const candidates = Array.from(document.querySelectorAll(actionSelector))
-            .filter(el => actionLabels.some(label => textOf(el).includes(label)));
-
-        for (const candidate of candidates) {
-            let current = candidate;
-            for (let depth = 0; current && depth < 20; depth += 1) {
-                const text = textOf(current);
-                if (variants.some(variant => text.includes(variant))) {
-                    return candidate.closest('button, a') || candidate;
-                }
-                current = current.parentElement;
-            }
-        }
-
-        const fundNodes = Array.from(document.querySelectorAll('span, p, div'))
-            .filter(el => variants.some(variant => textOf(el).includes(variant)));
-        for (const fundNode of fundNodes) {
-            let current = fundNode;
-            for (let depth = 0; current && depth < 20; depth += 1) {
-                const actions = Array.from(current.querySelectorAll(actionSelector))
-                    .filter(el => actionLabels.some(label => textOf(el).includes(label)));
-                if (actions.length > 0) {
-                    return actions[0].closest('button, a') || actions[0];
-                }
-                current = current.parentElement;
-            }
-        }
-        return null;
-    """
-
-    def find_element(d):
-        element = d.execute_script(script, variants)
-        if element and element.is_displayed():
-            return element
-        return False
-
-    return WebDriverWait(driver, timeout).until(find_element)
+    return WebDriverWait(driver, timeout, poll_frequency=0.25).until(
+        lambda d: find_fund_action(d, variants))
 
 def select_fixed_price_class_a(driver: WebDriver) -> bool:
     """Select Kelas A when MyASNB shows the fixed-price fund class modal."""
@@ -391,60 +492,28 @@ def select_fixed_price_class_a(driver: WebDriver) -> bool:
         print(f"Failed to select Kelas A: {e}")
         return False
 
-def detect_and_dismiss_block_popup(driver: WebDriver) -> bool:
-    """Detect and dismiss known navigation-stage block/error popups."""
-    lowercase = "abcdefghijklmnopqrstuvwxyz"
-    uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    block_xpaths = [
-        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'blocked due to too many retry')]" % (uppercase, lowercase),
-        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'blocked due to too many request')]" % (uppercase, lowercase),
-        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'try again in 5 minutes')]" % (uppercase, lowercase),
-        "//*[contains(translate(normalize-space(.), '%s', '%s'), '(1001)')]" % (uppercase, lowercase),
-        "//*[contains(translate(normalize-space(.), '%s', '%s'), 'insufficient units available')]" % (uppercase, lowercase),
-    ]
-
-    for bx in block_xpaths:
-        try:
-            wait_for_element(driver, By.XPATH, bx, timeout=2)
-            print("Block/error popup detected at navigation stage!")
-            dismissed = False
-
-            dismiss_xpaths = [
-                "//button[contains(., 'Close') or contains(., 'Tutup')]",
-                "//button[contains(., 'OK') or contains(., 'Ok')]",
-                "//*[@aria-label='Close' or @aria-label='Tutup' or @title='Close' or @title='Tutup']",
-                "//*[name()='svg' and (contains(@class, 'cursor-pointer') or contains(@class, 'absolute'))]",
-            ]
-            for dismiss_xpath in dismiss_xpaths:
-                try:
-                    button = wait_for_clickable_element(driver, By.XPATH, dismiss_xpath, timeout=2)
-                    try:
-                        button.click()
-                    except WebDriverException:
-                        driver.execute_script(
-                            """
-                            const clickEvent = new MouseEvent('click', {
-                                view: window, bubbles: true, cancelable: true
-                            });
-                            arguments[0].dispatchEvent(clickEvent);
-                            """,
-                            button,
-                        )
-                    print("Dismissed block popup.")
-                    dismissed = True
-                    break
-                except TimeoutException:
-                    continue
-
-            if dismissed:
-                between_actions()
-            else:
-                print("Warning: Popup text matched, but no clickable Close/OK/Tutup/X button was found.")
-            return True
-        except TimeoutException:
-            continue
-
-    return False
+def detect_and_dismiss_block_popup(driver: WebDriver) -> Union[bool, str]:
+    """Inspect current visible errors without serial selector timeouts."""
+    text = normalized_text(driver.find_element(By.TAG_NAME, "body").text)
+    if not any(token in text for token in (
+        "blocked due to", "too many request", "try again in 5 minutes",
+        "(1001)", "insufficient units available", "(068)",
+    )):
+        return False
+    print("Block/error popup detected at navigation stage!")
+    driver._asnb_block_retry_seconds = block_retry_seconds(text)
+    _, button = wait_for_clickable_any(driver, [
+        ("Close/OK", By.XPATH, "//button[normalize-space()='Close' or normalize-space()='Tutup' or normalize-space()='OK' or normalize-space()='Ok']"),
+        ("Labelled close", By.CSS_SELECTOR, "[aria-label='Close'], [aria-label='Tutup'], [title='Close'], [title='Tutup']"),
+        ("SVG close", By.CSS_SELECTOR, "div.fixed.inset-0 svg.absolute.cursor-pointer"),
+    ], description="block popup close")
+    driver.execute_script("""
+        arguments[0].dispatchEvent(new MouseEvent('click', {
+            view: window, bubbles: true, cancelable: true
+        }));
+    """, button)
+    print("Dismissed block popup.")
+    return "BLOCKED" if any(t in text for t in ("(1001)", "blocked due to", "too many request", "try again in 5 minutes")) else "INSUFFICIENT"
 
 # --- Debug Snapshot on Login Failure ---
 DEBUG_DIR = Path("debug_snapshots")
@@ -567,77 +636,10 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
         driver.get(MYASNB_LOGIN_URL)
         print(f"Navigated to {MYASNB_LOGIN_URL}")
 
-        # 2. Handle Optional Popup (Robust Multi-Selector Approach)
-        print("Checking for login page popup overlay...")
-        overlay_xpath = "//div[contains(@class, 'opacity-25 fixed inset-0 z-40 bg-black')]"
-        
-        # Multiple selector strategies for popup close button (tested and verified)
-        popup_close_selectors = [
-            ("CSS - SVG positioned (primary)", By.CSS_SELECTOR, "svg.absolute.top-1.right-1"),
-            ("CSS - SVG in rounded container", By.CSS_SELECTOR, "div.rounded-2xl svg"),
-            ("XPath - Positioned SVG", By.XPATH, "//svg[contains(@class, 'absolute') and contains(@class, 'cursor-pointer')]"),
-        ]
-        
-        try:
-            # Wait briefly for the overlay to appear (if it exists)
-            WebDriverWait(driver, 5).until(EC.presence_of_element_located((By.XPATH, overlay_xpath)))
-            print("Popup overlay detected. Attempting to find and click close button...")
-
-            popup_close_element = None
-            successful_selector = None
-            
-            # Try each selector in order
-            for selector_name, by_method, selector in popup_close_selectors:
-                try:
-                    print(f"Trying {selector_name}: {selector}")
-                    popup_close_element = WebDriverWait(driver, 3).until(
-                        EC.element_to_be_clickable((by_method, selector))
-                    )
-                    successful_selector = selector_name
-                    print(f"✓ Found clickable close button using: {selector_name}")
-                    break
-                except TimeoutException:
-                    print(f"✗ {selector_name} not found, trying next...")
-                    continue
-            
-            if not popup_close_element:
-                print("Warning: Could not find popup close button with any selector")
-                raise TimeoutException("No working popup close selector found")
-
-            # Use proper event dispatch for SVG elements (tested and verified working)
-            try:
-                print("Attempting JavaScript event dispatch on SVG close button...")
-                driver.execute_script("""
-                    const clickEvent = new MouseEvent('click', {
-                        view: window,
-                        bubbles: true,
-                        cancelable: true
-                    });
-                    arguments[0].dispatchEvent(clickEvent);
-                """, popup_close_element)
-                print("JavaScript event dispatch executed successfully.")
-            except Exception as js_click_err:
-                print(f"JavaScript event dispatch failed ({js_click_err}), trying direct click fallback...")
-                try:
-                    popup_close_element.click()
-                    print("Direct click executed successfully.")
-                except Exception as direct_click_err:
-                     print(f"Direct click also failed ({direct_click_err}). Popup might remain.")
-                     raise TimeoutException("Failed to click popup close button with any method.")
-
-            # Wait for the overlay to disappear
-            print("Waiting for popup overlay to disappear...")
-            WebDriverWait(driver, WAIT_TIMEOUT).until(
-                EC.invisibility_of_element_located((By.XPATH, overlay_xpath))
-            )
-            print("Popup overlay disappeared. Proceeding with login.")
-
-        except TimeoutException:
-            # This means either the overlay didn't appear initially, or it didn't disappear after clicking close
-            print("Popup overlay not detected initially, or did not disappear after attempting close. Assuming no active popup blocking interaction.")
-        except Exception as popup_err:
-            print(f"An unexpected error occurred while handling the popup: {popup_err}")
-            # Decide if you want to proceed or stop if popup handling fails unexpectedly
+        # Wait for optional announcements and verify that the form is reachable.
+        # Eager navigation can return before React mounts the login form.
+        wait_for_element(driver, By.NAME, "username", timeout=30)
+        dismiss_login_popups(driver)
 
         # 3. Enter Username (human-like typing)
         print("Entering username...")
@@ -660,6 +662,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
             description="'Teruskan' button",
         )
         print(f"Found 'Teruskan' button using: {selector_name}")
+        dismiss_login_popups(driver, target=continue_button_1, appearance_wait=0)
         human_click(driver, continue_button_1)
         print("'Teruskan' button clicked.")
 
@@ -678,6 +681,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
         print(f"Found confirmation button using: {selector_name}")
         print("Skipping security phrase comparison; continuing to password entry.")
         print("Clicking 'Yes'/'Ya' button...")
+        dismiss_login_popups(driver, target=yes_button, appearance_wait=0)
         human_click(driver, yes_button)
         print("'Yes'/'Ya' button clicked.")
         between_actions()
@@ -703,6 +707,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
             description="'Login'/'Log Masuk' button",
         )
         print(f"Found 'Login' button using: {selector_name}")
+        dismiss_login_popups(driver, target=login_button, appearance_wait=0)
         human_click(driver, login_button)
         print("'Login' button clicked.")
 
@@ -749,6 +754,8 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
             print("Login successful: Redirected to portfolio page.")
             print("Pausing briefly after login...")
             after_page_load(2.0, 4.0)
+            if get_api(driver):
+                get_api(driver).reset()
             return True
         except TimeoutException:
             # Check again for active session error after timeout
@@ -780,7 +787,7 @@ def login(driver: WebDriver, username: str, password: str, security_phrase: str 
         save_debug_snapshot(driver, f"UnexpectedException: {e}", "login")
         return False
 
-def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
+def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> Union[bool, str]:
     """
     Navigates from the dashboard to the fund purchase section for a specific fund.
 
@@ -796,19 +803,8 @@ def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
         return False
 
     try:
-        # Use alias-aware lookup first because ASM 2 may be rendered as "ASM 2 Wawasan".
-        try:
-            add_invest_span = find_add_invest_for_fund(driver, fund_to_buy, timeout=WAIT_TIMEOUT * 2)
-            print(f"Found 'Add Invest' span for '{fund_to_buy}' using alias-aware DOM lookup.")
-        except TimeoutException:
-            print("Alias-aware lookup failed. Trying legacy exact-text XPath lookup...")
-            try:
-                add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Pelaburan Tambahan')]]//span[contains(text(), 'Pelaburan Tambahan')])[1]"
-                add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
-            except Exception:
-                add_invest_xpath = f"(//div[./div/span[contains(text(), '{fund_to_buy}')] and .//span[contains(text(), 'Add Invest')]]//span[contains(text(), 'Add Invest')])[1]"
-                add_invest_span = wait_for_element(driver, By.XPATH, add_invest_xpath, timeout=WAIT_TIMEOUT * 2) # Longer timeout for dashboard elements
-            print(f"Found 'Add Invest' span for '{fund_to_buy}' using legacy XPath: {add_invest_xpath}")
+        add_invest_span = find_add_invest_for_fund(driver, fund_to_buy, timeout=WAIT_TIMEOUT * 2)
+        print(f"Found exact fund action for '{fund_to_buy}'.")
 
         # Scroll element into view, then click with human-like behavior
         try:
@@ -825,7 +821,9 @@ def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
         amount_input_xpath = "//input[@name='amount' and @type='text']"
         try:
             print(f"Verifying navigation by waiting for amount input: {amount_input_xpath}")
-            wait_for_element(driver, By.XPATH, amount_input_xpath, timeout=WAIT_TIMEOUT * 2)
+            nav_state = wait_purchase_state(driver, navigation=True)
+            if nav_state != "AMOUNT":
+                raise TimeoutException(f"Navigation outcome: {nav_state}")
             print("Successfully navigated to purchase page (amount input found).")
             return True
         except TimeoutException:
@@ -849,8 +847,9 @@ def navigate_to_purchase(driver: WebDriver, fund_to_buy: Optional[str]) -> bool:
                     except Exception as retry_err:
                         print(f"Kelas A retry did not reach amount input: {retry_err}")
 
-            if detect_and_dismiss_block_popup(driver):
-                return "BLOCKED"
+            nav_error = detect_and_dismiss_block_popup(driver)
+            if nav_error:
+                return nav_error
 
             print("No block popup found either. Navigation failed for unknown reason.")
             save_debug_snapshot(driver, f"Navigation failed after clicking Add Invest for {fund_to_buy}", "navigate_purchase")
@@ -1044,23 +1043,8 @@ def navigate_to_portfolio(driver: WebDriver) -> bool:
             ("Anchor with Akaun Saya span", By.XPATH, "//a[.//span[contains(text(), 'Akaun Saya')]]"),
         ]
         
-        my_account_element = None
-        successful_selector = None
-        
-        for selector_name, by_method, selector in my_account_selectors:
-            try:
-                print(f"Trying {selector_name}: {selector}")
-                my_account_element = wait_for_clickable_element(driver, by_method, selector, timeout=WAIT_TIMEOUT)
-                successful_selector = selector_name
-                print(f"✓ Found clickable 'My Account' element using: {selector_name}")
-                break
-            except TimeoutException:
-                print(f"✗ {selector_name} not found, trying next...")
-                continue
-        
-        if not my_account_element:
-            print("Warning: Could not find 'My Account' link with any selector")
-            return False
+        successful_selector, my_account_element = wait_for_clickable_any(
+            driver, my_account_selectors, description="My Account/Akaun Saya")
 
         print("Clicking 'My Account' element...")
         
@@ -1077,8 +1061,15 @@ def navigate_to_portfolio(driver: WebDriver) -> bool:
             # For anchor elements, regular click should work
             my_account_element.click()
         
+        WebDriverWait(driver, WAIT_TIMEOUT * 2, poll_frequency=0.25).until(
+            EC.url_to_be(MYASNB_PORTFOLIO_URL))
+        WebDriverWait(driver, WAIT_TIMEOUT * 2, poll_frequency=0.25).until(
+            lambda d: d.execute_script("""
+                return [...document.querySelectorAll('span')].some(e =>
+                    e.getClientRects().length && getComputedStyle(e).visibility !== 'hidden' &&
+                    /^(amanah saham malaysia|asm\\s*[23])/i.test(e.textContent.trim()));
+            """))
         print("Successfully navigated back to portfolio page.")
-        time.sleep(3) # Pause after navigation
         return True
         
     except (TimeoutException, NoSuchElementException, WebDriverException) as e:
@@ -1087,6 +1078,96 @@ def navigate_to_portfolio(driver: WebDriver) -> bool:
 
 
 # --- Modified Purchase Unit Function ---
+def pause_for_payment(driver, fund_name, amount, email_config=None):
+    """Notify once, then wait for manual final agreement and FPX completion."""
+    # Bring browser to foreground for manual payment
+    bring_browser_to_front(driver)
+
+    # Play platform-specific success notification + desktop banner
+    success_message = f"Success! You have RM{amount} amount of {fund_name} units available for purchase. Please complete the payment."
+    print(f"\n*** {success_message} ***\n")
+    send_desktop_notification("ASNB Purchase Ready!", f"RM{amount} of {fund_name} - Complete payment now!", sound=True)
+
+    # Take screenshot for email attachment
+    screenshot_paths = []
+    if email_config:
+        try:
+            screenshot_filename = f"asnb_success_{fund_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
+            screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
+            driver.save_screenshot(screenshot_path)
+            screenshot_paths = [screenshot_path]
+            print(f"📸 Screenshot saved: {screenshot_filename}")
+        except Exception as screenshot_err:
+            print(f"Warning: Could not take screenshot: {screenshot_err}")
+
+    # SMTP must not delay the payment prompt or desktop notification.
+    if email_config:
+        send_success_email_async(email_config, fund_name, amount, screenshot_paths)
+
+    try:
+        current_os = platform.system()
+        if current_os == "Darwin": # macOS
+            print("Playing macOS notification sound...")
+            subprocess.run(["say", success_message])
+        elif current_os == "Windows":
+            print("Playing Windows notification sound...")
+            # Play the default system asterisk sound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)
+            # Optionally, play a specific frequency/duration beep
+            # winsound.Beep(1000, 500) # Frequency 1000 Hz, Duration 500 ms
+        elif current_os == "Linux":
+            # Try spd-say first (common text-to-speech dispatcher)
+            if shutil.which("spd-say"):
+                print("Playing Linux notification sound via spd-say...")
+                os.system(f'spd-say "{success_message}"')
+            # Fallback: Try espeak if available (another common TTS engine)
+            elif shutil.which("espeak"):
+                 print("Playing Linux notification sound via espeak...")
+                 os.system(f'espeak "{success_message}"')
+            else:
+                print("No standard Linux notification command found (spd-say/espeak). Printing only.")
+                # Add other Linux sound commands here if needed (e.g., paplay, aplay)
+        else:
+            print(f"Unsupported OS ({current_os}) for sound notification.")
+
+        # Wait for user to complete payment and choose next action
+        print("\n--- Script paused. Please complete the payment manually in the browser. ---")
+        print("--- After payment, press ENTER to resume buying remaining funds. ---")
+        print("--- Or press Ctrl+C to stop the script. ---")
+
+    except Exception as sound_err:
+        print(f"Could not play notification sound: {sound_err}")
+
+    try:
+        print("\n>>> Press ENTER after completing payment to resume, or Ctrl+C to quit.")
+        print("[RESUME_READY]")
+        sys.stdout.flush()
+        # Threaded stdin reader so SIGTERM can interrupt (works on all platforms)
+        _resume_event = threading.Event()
+        _resume_eof = threading.Event()
+        def _stdin_reader():
+            try:
+                line = sys.stdin.readline()
+                if not line:  # EOF - pipe closed (GUI died)
+                    _resume_eof.set()
+                _resume_event.set()
+            except (EOFError, OSError):
+                _resume_eof.set()
+                _resume_event.set()
+        threading.Thread(target=_stdin_reader, daemon=True).start()
+        while not _resume_event.is_set():
+            _resume_event.wait(timeout=1.0)
+            trace_network(driver)
+        if _resume_eof.is_set():
+            print("\n--- Stdin closed (GUI exited?). Stopping. ---")
+            raise KeyboardInterrupt()
+        print("Resuming automation after payment...")
+        return "RESUME"
+    except (KeyboardInterrupt, EOFError):
+        print("\n--- User chose to stop. ---")
+        raise KeyboardInterrupt()
+
+
 def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[str], bank_name: str, email_config: dict = None, referral_code: str = '') -> Union[bool, str]:
     """
     Executes the purchase of units for a specified fund. Handles retry logic for insufficient units
@@ -1102,6 +1183,7 @@ def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[
         True: If the purchase reaches the final confirmation page.
         "RESUME": If the purchase succeeded and user wants to continue with remaining funds.
         "BLOCKED": If the 'Blocked due to retry' (1001) error occurs.
+        "UNCERTAIN": A submission may have been dispatched; manual review required.
         False: If any other error occurs or retries are exhausted.
     """
     print(f"Attempting to purchase units...")
@@ -1112,307 +1194,164 @@ def purchase_unit(driver: WebDriver, fund_name: Optional[str], amount: Optional[
 
     # fund_name is determined by the navigation step, not needed here unless verifying
     print(f"Amount to invest: {amount}")
+    submission_attempted = False
+    driver._asnb_submission_snapshot = None
     try:
-        # 1. Wait for and fill amount input
-        amount_input_xpath = "//input[@name='amount' and @type='text']"
-        print(f"Waiting for amount input: {amount_input_xpath}")
-        amount_field = wait_for_element(driver, By.XPATH, amount_input_xpath)
-        print(f"Entering amount: {amount}")
-        human_type(amount_field, str(amount))
-        print("Amount entered.")
-        between_actions()
-
-        # 2. Wait for and select bank from dropdown using the configured bank name
-        bank_select_xpath = "//select[@name='banks']"
-        print(f"Waiting for bank dropdown: {bank_select_xpath}")
-        bank_dropdown_element = wait_for_element(driver, By.XPATH, bank_select_xpath)
-
-        # Wait for dropdown options to populate (they load asynchronously)
-        bank_option_xpath = "//select[@name='banks']/option[not(@value='') and not(contains(text(), 'Pilih'))]"
-        for wait_attempt in range(10):
-            bank_dropdown = Select(bank_dropdown_element)
-            if len(bank_dropdown.options) > 1:
-                print(f"Bank dropdown populated with {len(bank_dropdown.options)} options.")
-                break
-            print(f"Waiting for bank options to load... (attempt {wait_attempt + 1}/10)")
-            time.sleep(1)
-        else:
-            print("Warning: Bank dropdown options did not populate after 10 seconds.")
-
-        bank_dropdown = Select(bank_dropdown_element)
-        print(f"Attempting to select bank: {bank_name}")
-        try:
-            bank_dropdown.select_by_visible_text(bank_name)
-            print(f"Bank '{bank_name}' selected successfully.")
-        except NoSuchElementException:
-            print(f"Warning: Bank '{bank_name}' not found in dropdown. Defaulting to 'Public Bank'.")
-            try:
-                bank_dropdown.select_by_visible_text("Public Bank")
-                print("Default bank 'Public Bank' selected.")
-            except NoSuchElementException:
-                print("Error: Default bank 'Public Bank' also not found. Cannot proceed.")
-                return False # Critical error if default bank isn't there
-
-        # 3. Fill referral code if configured
-        if referral_code:
-            print(f"Filling referral code (Kod Rujukan): {referral_code}")
-            try:
-                referral_input = driver.find_element(By.XPATH, "//input[@name='referral']")
-                human_type(referral_input, referral_code)
-                print(f"Referral code '{referral_code}' entered.")
-            except NoSuchElementException:
-                print("Warning: Referral code field (name='referral') not found on page. Skipping.")
+        api_transport = getattr(driver, '_asnb_purchase_transport', DEFAULT_PURCHASE_TRANSPORT) == 'api'
+        next_button = None
+        if not api_transport:
+            # 1. Wait for and fill amount input
+            amount_input_xpath = "//input[@name='amount' and @type='text']"
+            print(f"Waiting for amount input: {amount_input_xpath}")
+            amount_field = wait_for_element(driver, By.XPATH, amount_input_xpath)
+            print(f"Entering amount: {amount}")
+            human_type(amount_field, str(amount))
+            print("Amount entered.")
             between_actions()
 
-        # 4. Wait for and click agreement checkbox
-        checkbox_xpath = "//input[@type='checkbox' and @value='agree']"
-        print(f"Waiting for agreement checkbox: {checkbox_xpath}")
-        checkbox = wait_for_clickable_element(driver, By.XPATH, checkbox_xpath)
-        # Use JavaScript click for potentially tricky checkboxes
-        try:
-            print("Attempting JavaScript click on checkbox...")
-            driver.execute_script("arguments[0].click();", checkbox)
-            print("Checkbox clicked via JavaScript.")
-        except Exception as cb_click_err:
-             print(f"JavaScript click on checkbox failed ({cb_click_err}), trying direct click...")
-             checkbox.click() # Fallback to direct click
-             print("Checkbox clicked directly.")
+            # 2. Wait for and select bank from dropdown using the configured bank name
+            bank_select_xpath = "//select[@name='banks']"
+            print(f"Waiting for bank dropdown: {bank_select_xpath}")
+            bank_dropdown_element = wait_for_element(driver, By.XPATH, bank_select_xpath)
+
+            # Wait for dropdown options to populate (they load asynchronously)
+            bank_option_xpath = "//select[@name='banks']/option[not(@value='') and not(contains(text(), 'Pilih'))]"
+            for wait_attempt in range(10):
+                bank_dropdown = Select(bank_dropdown_element)
+                if len(bank_dropdown.options) > 1:
+                    print(f"Bank dropdown populated with {len(bank_dropdown.options)} options.")
+                    break
+                print(f"Waiting for bank options to load... (attempt {wait_attempt + 1}/10)")
+                time.sleep(1)
+            else:
+                print("Warning: Bank dropdown options did not populate after 10 seconds.")
+
+            bank_dropdown = Select(bank_dropdown_element)
+            print(f"Attempting to select bank: {bank_name}")
+            try:
+                bank_dropdown.select_by_visible_text(bank_name)
+                print(f"Bank '{bank_name}' selected successfully.")
+            except NoSuchElementException:
+                print(f"Warning: Bank '{bank_name}' not found in dropdown. Defaulting to 'Public Bank'.")
+                try:
+                    bank_dropdown.select_by_visible_text("Public Bank")
+                    print("Default bank 'Public Bank' selected.")
+                except NoSuchElementException:
+                    print("Error: Default bank 'Public Bank' also not found. Cannot proceed.")
+                    return False # Critical error if default bank isn't there
+
+            # 3. Fill referral code if configured
+            if referral_code:
+                print(f"Filling referral code (Kod Rujukan): {referral_code}")
+                try:
+                    referral_input = driver.find_element(By.XPATH, "//input[@name='referral']")
+                    human_type(referral_input, referral_code)
+                    print(f"Referral code '{referral_code}' entered.")
+                except NoSuchElementException:
+                    print("Warning: Referral code field (name='referral') not found on page. Skipping.")
+                between_actions()
+
+            # 4. Wait for and click agreement checkbox
+            checkbox_xpath = "//input[@type='checkbox' and @value='agree']"
+            print(f"Waiting for agreement checkbox: {checkbox_xpath}")
+            checkbox = wait_for_clickable_element(driver, By.XPATH, checkbox_xpath)
+            # Use JavaScript click for potentially tricky checkboxes
+            try:
+                print("Attempting JavaScript click on checkbox...")
+                driver.execute_script("arguments[0].click();", checkbox)
+                print("Checkbox clicked via JavaScript.")
+            except Exception as cb_click_err:
+                 print(f"JavaScript click on checkbox failed ({cb_click_err}), trying direct click...")
+                 checkbox.click() # Fallback to direct click
+                 print("Checkbox clicked directly.")
 
 
-        # 4. Locate the Next button
-        try:
-            next_button_xpath = "//button[@type='submit' and contains(., 'Seterusnya')]"
+            # Check both languages together instead of timing out on the absent one.
+            next_button_xpath = "//button[@type='submit' and (contains(., 'Seterusnya') or contains(., 'Next'))]"
             next_button = wait_for_clickable_element(driver, By.XPATH, next_button_xpath)
-        except:
-            next_button_xpath = "//button[@type='submit' and contains(., 'Next')]"
-            next_button = wait_for_clickable_element(driver, By.XPATH, next_button_xpath)
-        print(f"Locating Next button: {next_button_xpath}")
+            print(f"Locating Next button: {next_button_xpath}")
+
+        client = get_api(driver)
+        if client:
+            try:
+                driver._asnb_submission_snapshot = client.snapshot(fund_name_variants(fund_name), amount)
+            except (APISessionExpired, APIThrottled):
+                print("API session restricted before submission; returning to eligibility checks without clicking.")
+                return 'API_RECHECK'
+            except APIReadError:
+                print("Transaction-history baseline unavailable; uncertain responses will require browser review.")
 
         max_retries = 30 # Maximum attempts for the purchase click
         retry_count = 0
 
         while retry_count < max_retries:
-            print(f"Attempt {retry_count + 1}/{max_retries}: Clicking Next button...")
-            try:
-                next_button.click()
-                print("Next button clicked.")
-            except WebDriverException as click_err:
-                print(f"Error clicking Next button: {click_err}. Attempting to re-locate and retry.")
-                time.sleep(2) # Brief pause before re-locating
+            print(f"Attempt {retry_count + 1}/{max_retries}: {'API handoff experiment' if api_transport else 'Clicking Next button'}...")
+            submission_attempted = True
+            if api_transport:
+                from .api_purchase import submit_api_and_restore
+                from .handoff import HandoffError
                 try:
-                    next_button = wait_for_clickable_element(driver, By.XPATH, next_button_xpath)
-                    next_button.click()
-                    print("Next button clicked after re-locating.")
-                except Exception as relocate_click_err:
-                    print(f"Failed to click Next button even after re-locating: {relocate_click_err}")
-                    return False # Abort if clicking fails persistently
-
-
-            # Wait a bit for the page to react after clicking Next
-            time.sleep(3) # Adjust as needed
-
-            # --- Check for SUCCESS condition (Final Confirmation Page) ---
-            final_checkbox_xpath = "//input[@type='checkbox' and @value='agree']"
-            final_button_xpath = "//button[contains(., 'Teruskan Pembayaran') or contains(., 'Pembayaran') or contains(., 'Payment')]"
-            try:
-                print("Checking for final confirmation page elements...")
-                # Use shorter timeouts for checks, maybe slightly longer for page load
-                wait_for_element(driver, By.XPATH, final_checkbox_xpath, timeout=7)
-                wait_for_element(driver, By.XPATH, final_button_xpath, timeout=7)
+                    outcome = submit_api_and_restore(driver, fund_name, amount, bank_name, referral_code)
+                except HandoffError as error:
+                    print(str(error))
+                    return 'UNCERTAIN'
+            else:
+                outcome = submit_and_observe(driver, next_button, timeout=20)
+            if outcome == "UNCERTAIN":
+                save_debug_snapshot(driver, "Submission outcome uncertain; automatic replay paused", "purchase")
+                return "UNCERTAIN"
+            if outcome == "SUCCESS":
                 print("Successfully reached final payment confirmation page.")
 
-                # Bring browser to foreground for manual payment
-                bring_browser_to_front(driver)
+                return pause_for_payment(driver, fund_name, amount, email_config)
 
-                # Take screenshot for email attachment
-                screenshot_paths = []
-                if email_config:
-                    try:
-                        screenshot_filename = f"asnb_success_{fund_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                        screenshot_path = os.path.join(os.getcwd(), screenshot_filename)
-                        driver.save_screenshot(screenshot_path)
-                        screenshot_paths = [screenshot_path]
-                        print(f"📸 Screenshot saved: {screenshot_filename}")
-                    except Exception as screenshot_err:
-                        print(f"Warning: Could not take screenshot: {screenshot_err}")
-
-                # Send email notification if configured
-                if email_config:
-                    try:
-                        send_purchase_notification(
-                            email_config=email_config,
-                            success=True,
-                            fund_name=fund_name,
-                            amount=amount,
-                            screenshot_paths=screenshot_paths
-                        )
-                    except Exception as email_err:
-                        print(f"Warning: Failed to send email notification: {email_err}")
-
-                # Play platform-specific success notification + desktop banner
-                success_message = f"Success! You have RM{amount} amount of {fund_name} units available for purchase. Please complete the payment."
-                print(f"\n*** {success_message} ***\n")
-                send_desktop_notification("ASNB Purchase Ready!", f"RM{amount} of {fund_name} - Complete payment now!", sound=True)
-                try:
-                    current_os = platform.system()
-                    if current_os == "Darwin": # macOS
-                        print("Playing macOS notification sound...")
-                        subprocess.run(["say", success_message])
-                    elif current_os == "Windows":
-                        print("Playing Windows notification sound...")
-                        # Play the default system asterisk sound
-                        winsound.MessageBeep(winsound.MB_ICONASTERISK)
-                        # Optionally, play a specific frequency/duration beep
-                        # winsound.Beep(1000, 500) # Frequency 1000 Hz, Duration 500 ms
-                    elif current_os == "Linux":
-                        # Try spd-say first (common text-to-speech dispatcher)
-                        if shutil.which("spd-say"):
-                            print("Playing Linux notification sound via spd-say...")
-                            os.system(f'spd-say "{success_message}"')
-                        # Fallback: Try espeak if available (another common TTS engine)
-                        elif shutil.which("espeak"):
-                             print("Playing Linux notification sound via espeak...")
-                             os.system(f'espeak "{success_message}"')
-                        else:
-                            print("No standard Linux notification command found (spd-say/espeak). Printing only.")
-                            # Add other Linux sound commands here if needed (e.g., paplay, aplay)
-                    else:
-                        print(f"Unsupported OS ({current_os}) for sound notification.")
-
-                    # Wait for user to complete payment and choose next action
-                    print("\n--- Script paused. Please complete the payment manually in the browser. ---")
-                    print("--- After payment, press ENTER to resume buying remaining funds. ---")
-                    print("--- Or press Ctrl+C to stop the script. ---")
-
-                except Exception as sound_err:
-                    print(f"Could not play notification sound: {sound_err}")
-
-                try:
-                    print("\n>>> Press ENTER after completing payment to resume, or Ctrl+C to quit.")
-                    print("[RESUME_READY]")
-                    sys.stdout.flush()
-                    # Threaded stdin reader so SIGTERM can interrupt (works on all platforms)
-                    _resume_event = threading.Event()
-                    _resume_eof = threading.Event()
-                    def _stdin_reader():
-                        try:
-                            line = sys.stdin.readline()
-                            if not line:  # EOF - pipe closed (GUI died)
-                                _resume_eof.set()
-                            _resume_event.set()
-                        except (EOFError, OSError):
-                            _resume_eof.set()
-                            _resume_event.set()
-                    threading.Thread(target=_stdin_reader, daemon=True).start()
-                    while not _resume_event.is_set():
-                        _resume_event.wait(timeout=1.0)
-                    if _resume_eof.is_set():
-                        print("\n--- Stdin closed (GUI exited?). Stopping. ---")
-                        return True
-                    print("Resuming automation after payment...")
-                    return "RESUME"
-                except (KeyboardInterrupt, EOFError):
-                    print("\n--- User chose to stop. ---")
-                    return True
-
-            except TimeoutException:
-                    print("Final confirmation page not detected yet.")
-
-                    # --- Check for INSUFFICIENT UNITS error popup (068) ---
-                    insufficient_units_text_xpath = "//p[contains(text(), 'insufficient units available') and contains(text(), '(068)')]"
-                    insufficient_units_ok_xpath = "//div[.//p[contains(text(), 'insufficient units available')]]//button[contains(text(), 'OK')]"
-                    try:
-                        print("Checking for 'insufficient units' (068) error popup...")
-                        wait_for_element(driver, By.XPATH, insufficient_units_text_xpath, timeout=5)
-                        print("'Insufficient units' (068) error popup detected.")
-                        print(f"Waiting for OK button: {insufficient_units_ok_xpath}")
-                        error_ok_button = wait_for_clickable_element(driver, By.XPATH, insufficient_units_ok_xpath)
-                        print("Clicking OK button...")
-                        error_ok_button.click()
-                        print("OK button clicked.")
-                        stats.record_insufficient()
-                        retry_delay = random.uniform(3, 8)
-                        print(f"Waiting {retry_delay:.1f} seconds before retrying...")
-                        time.sleep(retry_delay)
-                        retry_count += 1
-                        print("Re-locating Next button for retry...")
-                        next_button = wait_for_clickable_element(driver, By.XPATH, next_button_xpath)
-                        continue # Retry clicking Next
-
-                    except TimeoutException:
-                        print("'Insufficient units' (068) error not found.")
-
-                        # --- Check for BLOCKED DUE TO RETRY error popup (1001) ---
-                        blocked_text_xpath = "//p[contains(text(), 'Blocked due to retry') or contains(text(), '(1001)')]"
-                        # Use same parent-agnostic pattern as the 068 OK button (which works reliably)
-                        blocked_ok_xpath = "//div[.//p[contains(text(), 'Blocked due to retry') or contains(text(), '(1001)')]]//button[contains(text(), 'OK')]"
-                        try:
-                            print("Checking for 'Blocked due to retry' (1001) error popup...")
-                            wait_for_element(driver, By.XPATH, blocked_text_xpath, timeout=5)
-                            print("'Blocked due to retry' (1001) error popup detected.")
-                            print(f"Waiting for OK button: {blocked_ok_xpath}")
-                            try:
-                                blocked_ok_button = wait_for_clickable_element(driver, By.XPATH, blocked_ok_xpath, timeout=5)
-                            except TimeoutException:
-                                # Fallback: try any visible OK button on the page
-                                print("Primary OK button XPath failed, trying fallback...")
-                                blocked_ok_button = wait_for_clickable_element(driver, By.XPATH, "//button[contains(text(), 'OK')]", timeout=5)
-                            print("Clicking OK button...")
-                            blocked_ok_button.click()
-                            print("OK button clicked.")
-                            print("Returning 'BLOCKED' status to switch funds.")
-                            return "BLOCKED" # Special status to indicate this specific error
-
-                        except TimeoutException:
-                            # Neither success nor any known error popup was found
-                            print("'Blocked due to retry' (1001) error not found.")
-                            print("Did not find final confirmation page OR any known error popup.")
-                            print("Assuming an unexpected state or different error. Aborting purchase attempt for this fund.")
-                            # Screenshot for debugging unexpected states
-                            try:
-                                debug_screenshot = f"asnb_debug_{fund_name.replace(' ', '_')}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                                driver.save_screenshot(debug_screenshot)
-                                print(f"Debug screenshot saved: {debug_screenshot}")
-                            except Exception:
-                                pass
-                            return False
-
-                    except Exception as e:
-                        print(f"An unexpected error occurred while handling popups: {e}")
-                        try:
-                            debug_screenshot = f"asnb_error_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-                            driver.save_screenshot(debug_screenshot)
-                            print(f"Error screenshot saved: {debug_screenshot}")
-                        except Exception:
-                            pass
-                        return False
+            else:
+                submission_attempted = False  # Explicit server rejection permits later retry.
+                print(f"Purchase response: {outcome}")
+                if api_transport:
+                    if outcome not in ('INSUFFICIENT', 'BLOCKED'):
+                        return 'UNCERTAIN'
+                else:
+                    _, ok_button = wait_for_clickable_any(driver, [
+                        ("Response OK", By.XPATH, "//button[normalize-space()='OK' or normalize-space()='Ok' or normalize-space()='Tutup' or normalize-space()='Close']"),
+                    ], description="purchase response dismissal")
+                    ok_button.click()
+                if outcome == "BLOCKED":
+                    return "BLOCKED"
+                stats.record_insufficient()
+                retry_count += 1
+                retry_delay = random.uniform(3, 8)
+                print(f"Waiting {retry_delay:.1f} seconds before retrying...")
+                time.sleep(retry_delay)
+                if not api_transport:
+                    next_button = wait_for_clickable_element(driver, By.XPATH, next_button_xpath)
 
         # If loop finishes after max_retries
         print(f"Purchase failed after {max_retries} retries, likely due to persistent 'insufficient units' error.")
         return False
 
     except (TimeoutException, NoSuchElementException) as e:
-        print(f"Error during purchase setup (before clicking Next): Could not find expected element. {e}")
-        return False
+        print(f"Error during purchase flow: Could not find expected element. {e}")
+        return "UNCERTAIN" if submission_attempted else False
     except WebDriverException as e:
         print(f"WebDriver error during purchase: {e}")
-        return False
+        return "UNCERTAIN" if submission_attempted else False
     except Exception as e:
         print(f"An unexpected error occurred during purchase: {e}")
-        return False
+        return "UNCERTAIN" if submission_attempted else False
 
 # --- Main Execution ---
-# Chrome restart interval: restart Chrome every N session refreshes to prevent memory leaks
-CHROME_RESTART_INTERVAL = 3
 
-def main(profile=None):
+
+def main(profile=None, purchase_transport=DEFAULT_PURCHASE_TRANSPORT,
+         api_subscription_transport='http'):
     """Main function to run the automation.
 
     Args:
         profile: Optional profile name to override credentials from [Profile.<name>] section.
     """
     driver = None
-    chrome_restart_count = 0
+    browser_health = None
     setup_logging(profile)
     try:
         label = f" [{profile}]" if profile else ""
@@ -1456,6 +1395,12 @@ def main(profile=None):
         loop_tries = int(config.get(prof_section, 'loop_tries', fallback=loop_tries))
         session_refresh_interval = int(config.get(prof_section, 'session_refresh_interval', fallback=session_refresh_interval))
 
+        memory_limit = config.getint(prof_section, 'browser_memory_limit_mb',
+            fallback=config.getint('Settings', 'browser_memory_limit_mb', fallback=3072))
+        if session_refresh_interval < 1 or memory_limit < 256:
+            raise ConfigError('session_refresh_interval must be >= 1 and browser_memory_limit_mb >= 256')
+        browser_health = BrowserHealth(limit_mb=memory_limit)
+
         email_config = get_email_config(config)
         if email_config:
             profile_recipient = config.get(prof_section, 'recipient_email', fallback='').strip()
@@ -1465,7 +1410,7 @@ def main(profile=None):
 
         loop_desc = "infinite" if loop_tries == 0 else str(loop_tries)
         referral_desc = referral_code if referral_code else "none"
-        print(f"Configuration loaded. Funds: {funds_to_try}, Loops: {loop_desc}, Amount: {amount_to_buy}, Bank: {bank_to_use}, Referral: {referral_desc}, Session refresh: {session_refresh_interval} attempts")
+        print(f"Configuration loaded. Funds: {funds_to_try}, Loops: {loop_desc}, Amount: {amount_to_buy}, Bank: {bank_to_use}, Referral: {referral_desc}, Session health check: {session_refresh_interval} attempts; browser RSS limit: {memory_limit} MiB")
         if email_config:
             recipient_emails = email_config.get('recipient_emails', [])
             if len(recipient_emails) > 1:
@@ -1493,9 +1438,46 @@ def main(profile=None):
             print(f"WARNING: Bank '{bank_to_use}' not in known list: {VALID_BANKS}")
             print("This may cause bank selection to fail. Check spelling in config.ini.")
 
+        tracing_enabled = config.getboolean(prof_section, 'network_trace',
+            fallback=config.getboolean('Settings', 'network_trace', fallback=True))
+        lean_assets = config.getboolean(prof_section, 'lean_assets',
+            fallback=config.getboolean('Settings', 'lean_assets', fallback=True))
+        page_load_strategy = config.get(prof_section, 'page_load_strategy',
+            fallback=config.get('Settings', 'page_load_strategy', fallback='eager')).strip()
+        if page_load_strategy not in ('normal', 'eager'):
+            raise ConfigError('page_load_strategy must be normal or eager')
+        print(f"Browser loading: {page_load_strategy}; decorative banner blocking: {lean_assets}; cache enabled.")
+        api_reads = config.getboolean(prof_section, 'api_reads',
+            fallback=config.getboolean('Settings', 'api_reads', fallback=True))
+        print(f"Read-only API preflight and reconciliation: {api_reads}")
+        print(f"Purchase transport: {purchase_transport} (final agreement and FPX payment remain manual)")
+        trace_name = hashlib.sha256(profile.encode()).hexdigest()[:12]
+        trace_path = Path('network_traces') / f'{trace_name}_{os.getpid()}.jsonl' if tracing_enabled else None
+        if trace_path:
+            print(f"Passive network trace: {trace_path} (redacted metadata, rotating files)")
+        def new_browser():
+            browser = get_webdriver("chrome", trace_path=trace_path, lean_assets=lean_assets,
+                                    page_load_strategy=page_load_strategy)
+            browser._asnb_purchase_transport = purchase_transport
+            if (api_reads or purchase_transport == 'api') and isinstance(browser.capabilities, dict):
+                browser._asnb_api = PortalAPI(browser)
+            return browser
+
+        if purchase_transport == 'api':
+            from .api_runner import run_http_runner
+            purchase_timeout = config.getint(prof_section, 'api_purchase_timeout_seconds',
+                fallback=config.getint('Settings', 'api_purchase_timeout_seconds', fallback=60))
+            if not 20 <= purchase_timeout <= 180:
+                raise ConfigError('api_purchase_timeout_seconds must be between 20 and 180')
+            run_http_runner(username, password, funds_to_try, amount_to_buy, bank_to_use,
+                            referral_code, loop_tries, session_refresh_interval, email_config,
+                            new_browser, sys.modules[__name__], purchase_timeout=purchase_timeout,
+                            subscription_transport=api_subscription_transport)
+            return
+
         # 2. Initialize WebDriver
         print("Initializing WebDriver...")
-        driver = get_webdriver("chrome") # Or get browser from config
+        driver = new_browser() # Or get browser from config
 
         # 3. Login with retry for active session conflicts
         max_login_retries = 3
@@ -1520,6 +1502,35 @@ def main(profile=None):
             print("Login failed after all retry attempts. Exiting.")
             return
 
+        def maintain_browser(cooldown_seconds):
+            nonlocal driver
+            trace_network(driver)
+            rss = browser_health.sample(driver)
+            if rss is not None:
+                print(f"Browser health: owned process-tree RSS {rss:.0f} MiB (limit {memory_limit} MiB; shared pages may be counted twice).")
+                print(f"Network health (current browser): {network_summary(driver)}")
+                if get_api(driver):
+                    print(f"Read-only API health: {get_api(driver).metrics}")
+            if not browser_health.restart_due(cooldown_seconds):
+                return True
+            print("Sustained browser memory limit exceeded. Restarting during cooldown." if cooldown_seconds >= 45
+                  else "Sustained browser memory limit exceeded; maximum deferral reached. Restarting.")
+            try:
+                logout(driver)
+            except WebDriverException as error:
+                print(f"Pre-maintenance logout failed: {error}")
+            close_webdriver(driver)
+            driver = new_browser()
+            browser_health.reset()
+            stats.record_refresh()
+            for attempt in range(3):
+                if login(driver, username, password, security_phrase):
+                    return True
+                if attempt < 2:
+                    time.sleep(5)
+            print("Browser maintenance re-login failed. Restarting automation.")
+            return False
+
         # 4. Loop through funds in round-robin (infinite if loop_tries=0, else limited)
         import itertools
         purchase_successful = False
@@ -1535,6 +1546,11 @@ def main(profile=None):
                 print(f"Reached maximum {max_attempts} attempts ({loop_tries} loops). Stopping.")
                 break
 
+            all_on_cooldown = all(fund_cooldowns.is_on_cooldown(f) for f in funds_to_try)
+            idle_window = min(fund_cooldowns.remaining_cooldown(f) for f in funds_to_try) if all_on_cooldown else 0
+            if not maintain_browser(idle_window):
+                return
+
             # Skip funds on block cooldown
             if fund_cooldowns.is_on_cooldown(current_fund):
                 remaining = fund_cooldowns.remaining_cooldown(current_fund)
@@ -1546,11 +1562,23 @@ def main(profile=None):
                     min_wait = min(fund_cooldowns.remaining_cooldown(f) for f in funds_to_try)
                     print(f"All funds on cooldown. Sleeping {min_wait:.0f}s until next fund available...")
                     send_desktop_notification("ASNB - All Blocked", f"All funds blocked. Sleeping {min_wait:.0f}s", sound=False)
-                    time.sleep(min_wait + 1)
+                    # Recompute after maintenance; logout/login consumes part of the cooldown.
+                    time.sleep(min(60, min_wait + 0.25))
                 else:
                     # Just skip this fund silently and try next
                     pass
                 continue
+
+            api_result = api_preflight(driver, current_fund, funds_to_try, bank_to_use)
+            if api_result == 'SKIP':
+                continue
+            if api_result == 'SESSION_EXPIRED':
+                if not (logout(driver) and login(driver, username, password, security_phrase)):
+                    return
+                continue
+            if purchase_transport != 'api' and api_result == 'READY' and getattr(driver, '_asnb_portfolio_refresh_needed', False) is True:
+                if not refresh_portfolio_ui(driver, current_fund):
+                    continue
 
             # Send periodic summary email
             maybe_send_summary_email(email_config)
@@ -1558,57 +1586,40 @@ def main(profile=None):
             stats.record_attempt(current_fund)
             print(f"\n--- Attempting purchase for fund: {current_fund} (Attempt {fund_attempt_count}) ---")
             
-            # Proactive session refresh after every N attempts to prevent stale sessions
+            # Check portfolio health instead of logging out on a fixed attempt count.
             if fund_attempt_count > 1 and (fund_attempt_count - 1) % session_refresh_interval == 0:
-                stats.record_refresh()
-                chrome_restart_count += 1
-
-                # Every Nth session refresh, also restart Chrome to prevent memory leaks
-                if chrome_restart_count % CHROME_RESTART_INTERVAL == 0:
-                    print(f"Full Chrome restart (refresh #{chrome_restart_count}) to free memory...")
-                    try:
-                        if logout(driver):
-                            print("Logout confirmed. Waiting for server to release session...")
-                            time.sleep(3)  # Give server time to fully terminate session
-                        else:
-                            print("Logout returned failure. Clearing cookies as fallback...")
-                            try:
-                                driver.delete_all_cookies()
-                            except Exception:
-                                pass
-                            time.sleep(3)
-                    except Exception:
-                        time.sleep(3)
-                    try:
-                        driver.quit()
-                        print("Old Chrome closed.")
-                    except Exception:
-                        pass
-                    driver = get_webdriver("chrome")
-                    if login(driver, username, password, security_phrase):
-                        print("✅ Chrome restarted and logged in successfully.")
+                try:
+                    client = get_api(driver)
+                    if client and api_result == 'READY':
+                        print("API session health verified by fresh preflight.")
                     else:
-                        print("❌ Re-login after Chrome restart failed. Exiting.")
+                        WebDriverWait(driver, 2, poll_frequency=0.25).until(
+                            lambda d: d.current_url == MYASNB_PORTFOLIO_URL and
+                            all(find_fund_action(d, fund_name_variants(f)) for f in funds_to_try))
+                    print("Session health check passed; keeping current login.")
+                except (TimeoutException, WebDriverException, APIReadError):
+                    print("Session health check failed. Refreshing login.")
+                    stats.record_refresh()
+                    if not (logout(driver) and login(driver, username, password, security_phrase)):
+                        print("Session recovery failed. Restarting automation.")
                         return
-                else:
-                    print(f"🔄 Proactive session refresh after {fund_attempt_count - 1} attempts...")
-                    if logout(driver):
-                        print("Proactive logout successful. Re-logging in...")
-                        if login(driver, username, password, security_phrase):
-                            print("✅ Proactive session refresh successful. Continuing...")
-                        else:
-                            print("❌ Proactive re-login failed. Exiting.")
-                            return
-                    else:
-                        print("⚠️ Proactive logout failed. Continuing without refresh...")
 
             # 4a. Navigate to Purchase Section for the current fund
-            nav_result = navigate_to_purchase(driver, current_fund)
+            nav_result = True if purchase_transport == 'api' else navigate_to_purchase(driver, current_fund)
+
+            if nav_result == "INSUFFICIENT":
+                stats.record_insufficient()
+                print(f"No units available for {current_fund}; rotating without a block cooldown.")
+                if not navigate_to_portfolio(driver):
+                    return
+                time.sleep(random.uniform(3, 8))
+                continue
 
             if nav_result == "BLOCKED":
+                mark_fund_ui_stale(driver, current_fund)
                 print(f"Fund {current_fund} blocked at navigation stage. Applying cooldown.")
                 stats.record_block(current_fund)
-                fund_cooldowns.mark_blocked(current_fund)
+                fund_cooldowns.mark_blocked(current_fund, getattr(driver, '_asnb_block_retry_seconds', 300))
                 if not navigate_to_portfolio(driver):
                     if logout(driver) and login(driver, username, password, security_phrase):
                         print("Session reset after nav block.")
@@ -1651,6 +1662,18 @@ def main(profile=None):
             # 4b. Attempt Purchase Unit, passing the bank name
             purchase_status = purchase_unit(driver, current_fund, amount_to_buy, bank_to_use, email_config, referral_code)
 
+            if purchase_status == "API_RECHECK":
+                if not navigate_to_portfolio(driver):
+                    return
+                continue
+
+            if purchase_status == "UNCERTAIN":
+                reconcile_submission(driver)
+                wait_for_submission_review(driver)
+                if not navigate_to_portfolio(driver):
+                    return
+                continue
+
             if purchase_status == "RESUME":
                 print(f"Purchase completed for {current_fund}. Resuming with remaining funds...")
                 purchase_successful = True
@@ -1662,10 +1685,11 @@ def main(profile=None):
                 except Exception as logout_err:
                     print(f"Pre-restart logout failed: {logout_err}")
                 try:
-                    driver.quit()
+                    close_webdriver(driver)
                 except Exception:
                     pass
-                driver = get_webdriver("chrome")
+                driver = new_browser()
+                browser_health.reset()
                 if login(driver, username, password, security_phrase):
                     print("Fresh session ready. Continuing with next fund...")
                 else:
@@ -1677,9 +1701,10 @@ def main(profile=None):
                 purchase_successful = True
                 break # Exit the loop on success (user chose Ctrl+C)
             elif purchase_status == "BLOCKED":
+                mark_fund_ui_stale(driver, current_fund)
                 stats.record_block(current_fund)
-                fund_cooldowns.mark_blocked(current_fund)
-                print(f"Purchase attempt for {current_fund} was blocked (1001). Cooldown {FundCooldownTracker.COOLDOWN_SECONDS}s. Trying next fund.")
+                fund_cooldowns.mark_blocked(current_fund, getattr(driver, '_asnb_block_retry_seconds', 300))
+                print(f"Purchase attempt for {current_fund} was blocked (1001). Cooldown {fund_cooldowns.remaining_cooldown(current_fund):.0f}s. Trying next fund.")
                 # Navigate back to portfolio page before trying the next fund
                 if not navigate_to_portfolio(driver):
                     print("Failed to navigate back to portfolio after 'Blocked' error. Attempting session reset...")
@@ -1729,7 +1754,7 @@ def main(profile=None):
     except DriverSetupError as e:
         print(f"Driver Setup Error: {e}")
     except KeyboardInterrupt:
-        print("\n--- Ctrl+C detected. Attempting graceful shutdown... ---")
+        print("\n--- Runner stopping. Attempting graceful shutdown... ---")
         print(stats.summary())
         if driver:
             try:
@@ -1743,26 +1768,12 @@ def main(profile=None):
         print(f"An unexpected error occurred in the main process: {e}")
     finally:
         if driver:
-            # Clean up temp Chrome data dir
-            try:
-                chrome_data_dir = None
-                for arg in driver.capabilities.get('chrome', {}).get('chromedriverArgs', []):
-                    if 'user-data-dir' in str(arg):
-                        chrome_data_dir = str(arg).split('=')[-1]
-            except Exception:
-                pass
-
             print("Closing WebDriver...")
-            driver.quit()
-            print("WebDriver closed.")
-
-            # Clean up temp data dir
-            if chrome_data_dir and chrome_data_dir.startswith(tempfile.gettempdir()) and 'chrome_asnb_' in chrome_data_dir:
-                try:
-                    shutil.rmtree(chrome_data_dir, ignore_errors=True)
-                    print(f"Cleaned up temp Chrome dir: {chrome_data_dir}")
-                except Exception:
-                    pass
+            try:
+                close_webdriver(driver)
+                print("WebDriver closed.")
+            except Exception as close_error:
+                print(f"WebDriver cleanup failed: {close_error}")
         print("--- Automation finished ---")
 
 if __name__ == "__main__":
@@ -1770,6 +1781,10 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="ASNB Buyer Automation")
     parser.add_argument("--profile", type=str, default=None,
                         help="Profile name to use from [Profile.<name>] section in config.ini")
+    parser.add_argument('--purchase-transport', choices=('ui', 'api'), default=DEFAULT_PURCHASE_TRANSPORT,
+                        help='Purchase submission transport (default: api); final payment stays manual')
+    parser.add_argument('--api-subscription-transport', choices=('http', 'chrome'), default='http',
+                        help='http: initialized HTTP (default); chrome: keep Chrome for API fetch')
     args = parser.parse_args()
 
     # Handle SIGTERM (from GUI Stop button) same as Ctrl+C
@@ -1797,7 +1812,8 @@ if __name__ == "__main__":
 
     while True:
         try:
-            main(profile=args.profile)
+            main(profile=args.profile, purchase_transport=args.purchase_transport,
+                 api_subscription_transport=args.api_subscription_transport)
         except KeyboardInterrupt:
             print("\n--- Script stopped (Ctrl+C or SIGTERM). ---")
             break

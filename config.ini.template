@@ -9,7 +9,24 @@ purchase_amount = 100
 bank_name = Public Bank
 referral_code =
 loop_tries = 0
+# Check session health every N fund attempts; re-login only when unhealthy.
 session_refresh_interval = 6
+# Per-browser summed process-tree RSS, not total machine Chrome memory.
+# Two readings >=60s apart above this limit schedule a restart, preferably in cooldown.
+browser_memory_limit_mb = 3072
+# Passive redacted request metadata; no API replay. Disable to avoid collection overhead.
+network_trace = true
+# Skip observed decorative hero banners; security images, logos, icons and FPX stay enabled.
+lean_assets = true
+# eager waits for DOM readiness; element/state checks still wait for the application.
+# Set normal to restore waiting for all page resources.
+page_load_strategy = eager
+# Read-only API eligibility/operating-hours checks and uncertain-submission history.
+# Disables optional API reads in UI mode only; API purchasing requires its metadata reads.
+api_reads = true
+# Wait longer for subscription responses; unknown outcomes still pause, never replay.
+# Range: 20-180 seconds. Also accepts a per-profile override.
+api_purchase_timeout_seconds = 60
 
 [Email]
 # SMTP settings for purchase notifications (shared across all profiles)

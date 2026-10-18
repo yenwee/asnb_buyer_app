@@ -1,5 +1,8 @@
 .PHONY: help setup run gui web stop status logs tail clean
 
+TRANSPORT ?= api
+API_SUBSCRIPTION_TRANSPORT ?= http
+
 help: ## Show available commands
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
 
@@ -9,7 +12,7 @@ setup: ## First time setup (venv + deps + config)
 	@[ -f config.ini ] || cp config.ini.template config.ini
 	@echo "Setup complete. Edit config.ini to add your [Profile.xxx] section, then run 'make gui' or 'make run P=xxx'."
 
-run: ## Run automation (usage: make run P=<profile>)
+run: ## Run automation (API default; UI override: TRANSPORT=ui)
 	@test -d .venv || { echo "Error: Run 'make setup' first."; exit 1; }
 	@test -f config.ini || { echo "Error: config.ini not found. Run 'make setup' then edit config.ini."; exit 1; }
 ifeq ($(P),)
@@ -23,7 +26,7 @@ ifeq ($(P),)
 	@echo ""
 	@echo "Example: make run P=yenwee"
 else
-	.venv/bin/python -m asnb.main --profile $(P)
+	.venv/bin/python -m asnb.main --profile $(P) --purchase-transport $(TRANSPORT) --api-subscription-transport $(API_SUBSCRIPTION_TRANSPORT)
 endif
 
 gui: ## Launch GUI (multi-account)

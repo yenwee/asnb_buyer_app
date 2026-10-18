@@ -21,199 +21,229 @@
 
 ---
 
-## The Problem
+## Overview
 
-ASNB fixed-price funds (ASM, ASM2, ASM3) are almost always fully subscribed. When units become available, they sell out in **seconds**. Buying manually means:
+Automates MyASNB login, fund selection and purchase retries using your configured
+account, fund, amount and bank. On subscription acceptance, it notifies you and
+pauses for the final agreement and FPX bank payment in Chrome. Payment is manual.
 
-- Refreshing the portal over and over
-- Clicking through 5 screens as fast as possible
-- Getting "insufficient units" errors 99% of the time
-- Doing this for hours, days, or weeks
-
-## The Solution
-
-This tool sits in the retry loop for you. It logs in, selects your fund, submits the purchase, and **retries automatically** when units aren't available. When it finally succeeds, it notifies you and pauses for you to complete the FPX bank payment manually.
-
-**You set it up once, walk away, and get an email when it's time to pay.**
-
-### Key Features
-
-- **Multi-account** -- run multiple MyASNB accounts simultaneously
-- **Smart retry** -- handles "insufficient units" (068) with automatic retry, skips "blocked" (1001) funds
-- **Web UI + GUI + CLI** -- localhost dashboard, visual desktop launcher, or simple `make run P=profile`
-- **Per-profile settings** -- different bank, amount, and funds for each account
-- **Email alerts** -- get notified with a screenshot when purchase succeeds
-- **Session management** -- auto-refreshes login to prevent stale data
-- **Debug snapshots** -- screenshots + reports saved on any failure
-
-> **Note:** This tool automates everything *except* the actual payment. You must complete the FPX bank transfer yourself when prompted.
-
-> **Legal:** This uses your own credentials for personal use. No security measures are bypassed. Use at your own risk -- see [Disclaimer](#disclaimer).
-
----
+- CLI, desktop GUI and localhost web dashboard; multiple account profiles.
+- HTTP purchasing by default, with temporary Chrome session initialization.
+- Insufficient-unit retries (`068`), fund cooldowns (`1001`) and session recovery.
+- Optional email alerts, per-profile logs and local diagnostic captures.
 
 ## Quick Start
+
+Install Python 3.11+ and Google Chrome. Brave is a macOS fallback.
 
 ### macOS / Linux
 
 ```bash
 git clone https://github.com/yenwee/asnb_buyer_app.git
 cd asnb_buyer_app
-make setup                 # creates venv, installs deps, copies config template
-# Edit config.ini -- add your [Profile.xxx] section (see below)
-make run P=yourprofile     # CLI mode
-make gui                   # GUI mode (all profiles)
-make web                   # Localhost web UI, opens browser automatically
+make setup
+# Edit config.ini and add a [Profile.<name>] section.
+make run P=yourprofile
 ```
 
 ### Windows
 
-```
+```bat
 git clone https://github.com/yenwee/asnb_buyer_app.git
 cd asnb_buyer_app
-setup.bat                  # creates venv, installs deps, copies config template
-# Edit config.ini -- add your [Profile.xxx] section (see below)
-run.bat yourprofile        # CLI mode
-gui.bat                    # GUI mode (all profiles)
+setup.bat
+rem Edit config.ini and add a [Profile.<name>] section.
+run.bat yourprofile
 ```
 
-## How It Works
+### Launchers
 
-```mermaid
-flowchart TD
-    A[Start] --> B[Login to MyASNB]
-    B --> C{Active Session?}
-    C -->|Yes| D[Wait 90s, retry]
-    C -->|No| E[Go to Portfolio]
-    D --> E
+| Command | Action |
+| --- | --- |
+| `make run P=<profile>` | Run one profile; defaults to initialized HTTP. |
+| `make run` | List profiles. |
+| `make gui` | Desktop GUI with account tabs (`gui.bat` on Windows). |
+| `make web` | Open the local dashboard at `http://127.0.0.1:8765`. |
+| `make tail` | Follow logs. |
+| `make stop` | Stop runners. |
 
-    E --> F[Select Fund]
-    F --> G[Enter Amount + Bank]
-    G --> H[Submit Purchase]
-
-    H --> I{Result?}
-    I -->|Success| J["Notify + Pause for Payment"]
-    I -->|068 Insufficient| K[Retry up to 30x]
-    K --> H
-    I -->|1001 Blocked| L[Try Next Fund]
-    L --> F
-
-    J --> M[You Complete FPX Payment]
-```
+The web dashboard can edit profiles and start/stop/resume runners with live logs.
+Use `PORT=9000 make web` to change its port.
 
 ## Configuration
 
-### Profile Setup
-
-Each `[Profile.xxx]` section in `config.ini` is one MyASNB account:
+Copy `config.ini.template` to `config.ini` if setup has not already done so.
+Each `[Profile.<name>]` is one account; missing settings fall back to `[Settings]`.
+Keep credentials in the ignored `config.ini`.
 
 ```ini
 [Profile.ali]
-username = asnb1234              # MyASNB login ID
-password = MyP@ssw0rd            # MyASNB password
-security_phrase = my phrase       # Optional; kept for compatibility
-bank_name = Maybank2U            # FPX bank (see list below)
-purchase_amount = 1000           # RM per attempt
+username = your_login_id
+password = your_password
+bank_name = Maybank2U
+purchase_amount = 1000
 funds_to_try = Amanah Saham Malaysia, Amanah Saham Malaysia 2 Wawasan
-recipient_email = ali@gmail.com  # Email notification
-```
+recipient_email = you@example.com
 
-You can have as many profiles as you want. Run them all at once with `make gui` or one at a time with `make run P=ali`.
-
-### Localhost Web UI
-
-Use the browser-based control panel when you want to edit profile settings and run accounts from one place:
-
-```bash
-make web
-```
-
-This opens `http://127.0.0.1:8765` automatically. From there you can update each profile's funds, amount, bank, referral code, and notification email, then save/start/stop/resume runners with live logs.
-
-Optional host/port:
-
-```bash
-PORT=9000 make web
-HOST=0.0.0.0 PORT=8765 make web
-```
-
-### Global Defaults
-
-`[Settings]` provides fallbacks for any field not set in a profile:
-
-```ini
 [Settings]
 funds_to_try = Amanah Saham Malaysia 2 Wawasan
 purchase_amount = 100
 bank_name = Public Bank
-loop_tries = 0                   # 0 = infinite retry
-session_refresh_interval = 6     # re-login every N fund attempts
+referral_code =
+loop_tries = 0
+session_refresh_interval = 6
+browser_memory_limit_mb = 3072
+network_trace = true
+lean_assets = true
+page_load_strategy = eager
+api_reads = true
+api_purchase_timeout_seconds = 60
 ```
 
-### Available Banks
+`purchase_amount` is RM per attempt; `loop_tries = 0` runs continuously.
+Fund codes resolve from portfolio metadata: ASM → `ASM`, ASM 2 Wawasan → `ASW`,
+ASM 3 → `AS1M`. Holdings printed after login are current investments, not a bank
+balance or a count of units available to buy.
 
-Affin Bank, Alliance Bank, AmBank, Bank Islam, Bank Rakyat, Bank Muamalat, CIMB Clicks, Hong Leong Bank, HSBC Bank, Maybank2U, Public Bank, RHB Bank, UOB Bank, BSN, KFH, Maybank2E, OCBC Bank, Standard Chartered, AGRONet, Bank of China
+`lean_assets` skips observed promotional images while retaining application and
+security resources. Set it to `false` and `page_load_strategy` to `normal` for
+standard loading. `api_reads` controls optional API reads in UI mode; the default
+API runner always requires account/fund/bank metadata reads. The subscription read
+timeout accepts 20–180 seconds globally or per profile.
 
-### Email Notifications (Optional)
+Session health/memory settings apply to the UI flow: healthy logins stay active;
+sustained process-tree memory pressure can schedule a browser restart outside
+payment/review pauses. The HTTP runner reinitializes on read-time session expiry.
+See the template comments for additional settings and bank names.
+
+### Email notifications
 
 ```ini
 [Email]
-smtp_server = smtp.gmail.com    # Gmail requires App Password
+smtp_server = smtp.gmail.com
 smtp_port = 587
-sender_email = you@gmail.com
+sender_email = you@example.com
 sender_password = your_app_password
-recipient_email = you@gmail.com
+recipient_email = you@example.com
 send_on_success = true
 ```
 
-## Commands
+Gmail requires an App Password. Each profile can override the recipient.
+Desktop payment alerts and the manual payment prompt do not wait for SMTP.
 
-### macOS / Linux
+## Purchase Flow
+
+```mermaid
+flowchart TD
+    A[HTTP login and account verification] --> B[Chrome initialization and portfolio readiness]
+    B --> C[Copy cookies to HTTP]
+    C --> D[HTTP purchase attempt]
+    D --> E{Response}
+    E -->|068 or 1001| F[Close initial Chrome; retry or rotate with cooldown]
+    F --> D
+    E -->|Accepted| G[Open or reuse Chrome; import current session]
+    G --> H[Manual final agreement and FPX payment]
+    E -->|Unknown or malformed| I[Stop for manual review; no replay]
+```
+
+The default uses HTTP login and metadata reads without opening a purchase form.
+Before the first eligible attempt, Chrome loads the normal portal and the runner
+waits for its authenticated portfolio request to finish. Its initialized cookies
+are copied back to HTTP. After the first explicit `068`/`1001` rejection, Chrome
+closes; later HTTP attempts reuse the session without reopening it. Session expiry
+starts a fresh login/initialization cycle.
+
+`068` retries up to 30 times per fund cycle with a 3–8 second delay. `1001` applies
+the server-directed cooldown and rotates funds. Initial investment terms remain
+accepted in the API payload, preserving the original automated flow.
+
+On acceptance, Chrome opens or is reused with the current session and navigates
+to the final agreement page. Its final checkbox stays unchecked and payment stays
+disabled until you accept manually. After payment/review, Enter resumes the runner;
+Ctrl+C stops it. Subscription acceptance is not completed FPX payment.
+
+Timeouts, HTTP 524, unrecognized rejections, malformed responses and failed
+handoffs stop automatic submissions for review. Check transaction history and
+any pending payment before starting another run. Missing/delayed history does
+not prove failure; uncertain requests have no automatic retry or transport fallback.
+
+### Transport overrides
+
 ```bash
-make run P=ali     # Run a specific profile
-make run           # List available profiles
-make gui           # Launch GUI (all profiles)
-make web           # Launch localhost web UI
-make tail          # Live log output
-make stop          # Stop everything
+make run P=ali                                      # Initialized HTTP (default)
+make run P=ali API_SUBSCRIPTION_TRANSPORT=chrome     # API fetch with Chrome kept open
+make run P=ali TRANSPORT=ui                         # Original form-based UI flow
+
+# Equivalent default CLI:
+python -m asnb.main --profile ali
 ```
 
-### Windows
+GUI/web launches use the same HTTP default. Restart existing runners to load
+changes. Startup should report `Purchase transport: api` and
+`subscription transport=http`.
+
+User runs received HTTP 200 / `068`, including four HTTP requests after Chrome
+closed. Browser-free and delay-only initialization experiments returned 524 and
+were removed. The precise timeout cause remains unverified. Accepted-order
+reopening and FPX completion through the final runner remain unverified; dummy
+confirmation rendering and cookie transfer have separate live/offline checks.
+
+## Logs and Troubleshooting
+
+Logs include transport, timing, HTTP status and business codes without passwords,
+cookie values or signed FPX fields. Passive Chrome metadata traces under
+`network_traces/` contain hashed endpoint IDs and rotate at 1 MiB with three
+backups per runner. Chrome telemetry covers only the browser's active lifetime.
+
+Separate `*.purchase-private.jsonl` captures retain complete observed Chrome
+purchase request/response bodies and can contain sensitive payment data. They use
+owner-only files on macOS/Linux. Keep captures, screenshots and logs local; they
+are ignored by Git. Set `network_trace = false` to disable Chrome collection.
+
+| Problem | Action |
+| --- | --- |
+| Login rejected or active-session conflict | Check credentials/session status; HTTP login stops without credential retries. |
+| HTTP 524, timeout or REVIEW | Inspect transaction history/pending payment. Do not assume the order failed. |
+| Bank unavailable | Match its display name in `config.ini.template`, such as `Maybank2U`. |
+| UI elements or funds missing | Portal structure/session state may have changed; inspect local diagnostics. |
+| WebDriver setup fails | Confirm Chrome/Brave is installed and inspect the driver error. |
+| Email missing | Verify SMTP/App Password and spam folder; payment remains manual. |
+
+## Tests
+
+Python tests mock purchase/payment calls:
+
+```bash
+.venv/bin/python -m unittest discover -s tests -q
 ```
-run.bat ali        # Run a specific profile
-run.bat            # List available profiles
-gui.bat            # Launch GUI (all profiles)
+
+Offline browser checks require Node.js and Chrome. Install Playwright, then fetch
+pinned public frontend assets using GET requests only:
+
+```bash
+npm install --no-save --package-lock=false playwright@1.57.0
+.venv/bin/python tests/fetch_handoff_assets.py
+node tests/browser_handoff_smoke.cjs
+node tests/browser_transport_smoke.cjs
 ```
+
+Set `PLAYWRIGHT_MODULE` to the package directory if installed outside normal Node
+resolution. Asset downloads are SHA-256 verified against
+`tests/fixtures/portal-assets.json` and stored in ignored `output/playwright/handoff/`.
+Changed/unavailable assets require contract/manifest review. Browser tests use
+dummy fixtures and intercept every URL; they never attach to your authenticated
+browser or send live purchase/payment requests.
 
 ## Architecture
 
-```
-asnb/
-  main.py       Automation engine -- login, purchase, retry loops, session mgmt
-  config.py     Config loading + profile discovery
-  driver.py     Chrome/Brave WebDriver setup (ARM64 Mac compatible)
-  email.py      SMTP notifications with screenshot attachments
-  actions.py    Human-like browser interactions (typing, clicking, scrolling)
-  gui.py        ttkbootstrap GUI with multi-account tabs
-  web.py        Localhost web UI for config edits + live runner control
-```
-
-## Troubleshooting
-
-| Problem | Solution |
-|---------|----------|
-| Login fails | Check username/password. Active session clears in ~1 min. |
-| Element not found | Website may have changed. Check `debug_snapshots/` for clues. |
-| WebDriver error | Ensure Chrome/Brave installed. Delete `~/.wdm` for fresh driver. |
-| Bank not found | Exact spelling matters (e.g., `Maybank2U` not `maybank`). |
-| Email not sending | Use Gmail App Password (not regular password). Check spam. |
-| Funds not loading | Session refresh triggers automatically. Restart if persistent. |
-
-## Requirements
-
-- Python 3.11+
-- Google Chrome (primary) or Brave Browser (macOS fallback)
-- macOS, Linux, or Windows
+| Files | Responsibility |
+| --- | --- |
+| `main.py`, `api_runner.py` | Launch/configuration, UI orchestration and HTTP runner lifecycle. |
+| `http_portal.py`, `api.py` | HTTP authentication, restricted writes and read-only metadata/history. |
+| `browser_transport.py`, `handoff.py` | Portal readiness, cookie transfer, Chrome fetch and confirmation state. |
+| `driver.py`, `assets.py`, `health.py`, `popups.py`, `purchase_state.py` | Browser setup, loading, health checks, popup/outcome handling. |
+| `network.py`, `email.py` | Local telemetry and notifications. |
+| `config.py`, `gui.py`, `web.py` | Profiles and launch interfaces. |
 
 ## Disclaimer
 

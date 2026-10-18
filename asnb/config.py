@@ -126,7 +126,7 @@ def get_session_refresh_interval(config: configparser.ConfigParser) -> int:
         config: The loaded ConfigParser object.
         
     Returns:
-        The number of fund attempts before refreshing session (default: 6)
+        The number of fund attempts between session health checks (default: 6)
     """
     return config.getint('Settings', 'session_refresh_interval', fallback=6)
 

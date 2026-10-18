@@ -136,7 +136,11 @@ class WebRunner:
             line = line.rstrip("\n")
             if not line:
                 continue
-            if self.RESUME_MARKER in line:
+            if '[REVIEW_REQUIRED]' in line:
+                with self._lock:
+                    self.status = 'review'
+                self.log('Outcome unknown. Review transactions and pending payment before Resume.')
+            elif self.RESUME_MARKER in line:
                 with self._lock:
                     self.status = "payment"
                 self.log("Payment ready. Complete payment in browser, then resume.")
@@ -146,7 +150,6 @@ class WebRunner:
         with self._lock:
             if self.process is proc:
                 self.process = None
-            if self.status != "payment":
                 self.status = "stopped"
         self.log(f"Process exited with code {code}.")
 
@@ -249,9 +252,9 @@ def render_page():
         settings = get_profile_settings(config, profile_key, profile_data)
         runner = STATE.get_runner(profile_key).snapshot()
         status = runner["status"]
-        start_disabled = "disabled" if status in {"running", "payment"} else ""
+        start_disabled = "disabled" if status in {"running", "payment", "review"} else ""
         stop_disabled = "disabled" if status == "stopped" else ""
-        resume_disabled = "" if status == "payment" else "disabled"
+        resume_disabled = "" if status in {"payment", "review"} else "disabled"
         fund_checks = "\n".join(
             f'<label class="chip"><input type="checkbox" name="funds" value="{html.escape(fund)}" '
             f'{"checked" if fund in settings["funds"] else ""}> <span>{html.escape(fund)}</span></label>'
@@ -336,7 +339,7 @@ def render_page():
     p {{ margin: 4px 0 0; color: var(--muted); }}
     .status {{ min-width: 86px; text-align: center; padding: 5px 8px; border-radius: 6px; font-size: 12px; font-weight: 800; background: #e5e7eb; color: #475467; }}
     .status-running {{ background: #ccfbf1; color: #115e59; }}
-    .status-payment {{ background: #fef3c7; color: #92400e; }}
+    .status-payment, .status-review {{ background: #fef3c7; color: #92400e; }}
     .grid {{ display: grid; grid-template-columns: 1.4fr .7fr .8fr 1.3fr; gap: 10px; margin-top: 12px; }}
     label {{ display: grid; gap: 5px; font-size: 13px; color: var(--muted); }}
     label > span {{ font-weight: 700; }}
@@ -387,9 +390,9 @@ def render_page():
         const status = section.querySelector('.status');
         status.textContent = data.status.toUpperCase();
         status.className = 'status status-' + data.status;
-        section.querySelector('button[value="start"]').disabled = data.status === 'running' || data.status === 'payment';
+        section.querySelector('button[value="start"]').disabled = ['running', 'payment', 'review'].includes(data.status);
         section.querySelector('button[value="stop"]').disabled = data.status === 'stopped';
-        section.querySelector('button[value="resume"]').disabled = data.status !== 'payment';
+        section.querySelector('button[value="resume"]').disabled = !['payment', 'review'].includes(data.status);
         const log = section.querySelector('pre');
         log.textContent = data.logs.join('\\n');
         log.scrollTop = log.scrollHeight;

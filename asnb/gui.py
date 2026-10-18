@@ -137,7 +137,9 @@ class AccountRunner:
             for line in proc.stdout:
                 line = line.rstrip('\n')
                 if line:
-                    if self.RESUME_MARKER in line:
+                    if '[REVIEW_REQUIRED]' in line:
+                        self.root.after(0, self._show_review)
+                    elif self.RESUME_MARKER in line:
                         self.root.after(0, self._show_resume)
                     else:
                         self.root.after(0, self.log, line)
@@ -154,6 +156,14 @@ class AccountRunner:
         self.status_label.configure(text="  PAYMENT  ", bootstyle="inverse-warning")
         self.log("Payment ready! Complete payment in browser, then click Resume.")
         if self.resume_btn:
+            self.resume_btn.configure(state="normal")
+            self.resume_btn.pack(side=RIGHT, padx=(5, 0))
+
+    def _show_review(self):
+        self.status_label.configure(text="  REVIEW  ", bootstyle="inverse-warning")
+        self.log("Outcome unknown. Review transactions and pending payment before Resume.")
+        if self.resume_btn:
+            self.resume_btn.configure(state="normal")
             self.resume_btn.pack(side=RIGHT, padx=(5, 0))
 
     def _on_end(self):

@@ -9,6 +9,11 @@ import platform
 import signal
 import time
 import subprocess
+import tempfile
+import shutil
+from .network import NetworkTrace, trace_network
+from .assets import configure_assets
+from .api import get_api
 
 # Define WebDriver type for hinting (using Union for Python < 3.10 compatibility)
 WebDriver = Union[Type[webdriver.Chrome], Type[webdriver.Firefox], Type[webdriver.Edge]] # Add others if needed
@@ -17,7 +22,8 @@ class DriverSetupError(Exception):
     """Custom exception for WebDriver setup errors."""
     pass
 
-def get_webdriver(browser: str = "chrome") -> WebDriver:
+def get_webdriver(browser: str = "chrome", trace_path=None, lean_assets=True,
+                  page_load_strategy='eager') -> WebDriver:
     """
     Initializes and returns a Selenium WebDriver instance for the specified browser.
 
@@ -34,8 +40,18 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
         DriverSetupError: If the specified browser is not supported or
                           if WebDriver setup fails.
     """
+    chrome_data_dir = None
+    driver = None
     try:
         chrome_options = ChromeOptions()
+        if page_load_strategy not in ('normal', 'eager'):
+            raise ValueError('page_load_strategy must be normal or eager')
+        chrome_options.page_load_strategy = page_load_strategy
+        if trace_path is not None:
+            chrome_options.set_capability('goog:loggingPrefs', {'performance': 'ALL'})
+            chrome_options.add_experimental_option('perfLoggingPrefs', {
+                'enableNetwork': True, 'enablePage': False,
+            })
         
         # ARM64 Mac-specific Chrome options to prevent status code -9 issues
         if platform.system() == "Darwin" and platform.machine() == "arm64":
@@ -66,18 +82,6 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
             # Use a fresh user data directory each time to avoid stale lock files
             # When Chrome is killed without proper shutdown, it leaves SingletonLock
             # in the data dir, preventing new instances from starting
-            import tempfile
-            import glob
-
-            # Clean up any stale chrome_asnb_ dirs from previous runs
-            stale_dirs = glob.glob(os.path.join(tempfile.gettempdir(), "chrome_asnb_*"))
-            for stale_dir in stale_dirs:
-                try:
-                    import shutil
-                    shutil.rmtree(stale_dir, ignore_errors=True)
-                except Exception:
-                    pass
-
             chrome_data_dir = tempfile.mkdtemp(prefix="chrome_asnb_")
             chrome_options.add_argument(f"--user-data-dir={chrome_data_dir}")
             
@@ -167,13 +171,50 @@ def get_webdriver(browser: str = "chrome") -> WebDriver:
         else:
             raise DriverSetupError(f"Unsupported browser: {browser}")
 
+        driver._asnb_data_dir = chrome_data_dir
+        configure_assets(driver, lean_assets=lean_assets)
+        if trace_path is not None:
+            try:
+                driver._asnb_network_trace = NetworkTrace(trace_path)
+            except OSError:
+                print("Network trace file unavailable; purchasing continues without telemetry.")
         print(f"{browser.capitalize()} WebDriver initialized successfully.")
         return driver
     except WebDriverException as e:
+        _cleanup_failed_setup(driver, chrome_data_dir)
         raise DriverSetupError(f"Failed to initialize {browser} WebDriver: {e}") from e
     except Exception as e:
+        _cleanup_failed_setup(driver, chrome_data_dir)
         # Catch other potential errors during driver download/setup
         raise DriverSetupError(f"An unexpected error occurred during WebDriver setup: {e}") from e
+
+def close_webdriver(driver):
+    """Quit a browser before removing only the temporary profile it owns."""
+    client = get_api(driver)
+    if client:
+        client.close()
+        driver._asnb_api = None
+    trace_network(driver, force=True)
+    trace = getattr(driver, '_asnb_network_trace', None)
+    if isinstance(trace, NetworkTrace):
+        trace.close()
+    driver.quit()
+    data_dir = getattr(driver, '_asnb_data_dir', None)
+    if data_dir:
+        shutil.rmtree(data_dir, ignore_errors=True)
+        driver._asnb_data_dir = None
+
+
+def _cleanup_failed_setup(driver, data_dir):
+    if driver is not None:
+        try:
+            driver.quit()
+        except Exception:
+            # Preserve the profile if the browser may still be using it.
+            return
+    if data_dir:
+        shutil.rmtree(data_dir, ignore_errors=True)
+
 
 # Example usage (optional, for testing the module directly)
 if __name__ == "__main__":
@@ -189,4 +230,4 @@ if __name__ == "__main__":
     finally:
         if driver_instance:
             print("Closing WebDriver.")
-            driver_instance.quit()
+            close_webdriver(driver_instance)
