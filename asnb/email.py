@@ -25,7 +25,7 @@ def send_purchase_notification(
     
     Args:
         email_config: Dictionary containing email configuration
-        success: Whether the purchase was successful
+        success: Whether subscription reached confirmation; does not mean payment completed
         fund_name: Name of the fund attempted
         amount: Amount attempted to purchase
         error_message: Error message if purchase failed
@@ -98,10 +98,10 @@ def send_purchase_notification(
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         if success:
-            subject_status = "✅ SUCCESS"
+            subject_status = "PAYMENT REQUIRED"
             html_color = "#28a745"  # Green
             text_content = f"""
-ASNB Purchase Successful!
+ASNB Subscription Accepted - Payment Required
 
 Fund: {fund_name or 'Unknown'}
 Amount: RM {amount or 'Unknown'}
@@ -109,6 +109,7 @@ Time: {timestamp}
 
 The purchase has reached the final payment confirmation page.
 Please complete the payment manually in your browser.
+This notification does not confirm payment or credited units.
 
 This is an automated notification from your ASNB Buyer script.
 """
@@ -116,7 +117,7 @@ This is an automated notification from your ASNB Buyer script.
 <html>
   <body>
     <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
-      <h2 style="color: {html_color};">🎉 ASNB Purchase Successful!</h2>
+      <h2 style="color: {html_color};">ASNB Subscription Accepted - Payment Required</h2>
       
       <div style="background-color: #f8f9fa; padding: 20px; border-radius: 5px; margin: 20px 0;">
         <h3>Purchase Details:</h3>
@@ -128,7 +129,8 @@ This is an automated notification from your ASNB Buyer script.
       <div style="background-color: #fff3cd; padding: 15px; border-radius: 5px; border-left: 4px solid #ffc107;">
         <p><strong>⚠️ Action Required:</strong><br>
         The purchase has reached the final payment confirmation page.<br>
-        Please complete the payment manually in your browser.</p>
+        Please complete the payment manually in your browser.<br>
+        This notification does not confirm payment or credited units.</p>
       </div>
       
       <hr style="margin: 30px 0;">
