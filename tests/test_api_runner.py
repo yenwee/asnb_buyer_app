@@ -296,6 +296,23 @@ class APIRunnerTests(unittest.TestCase):
         self.browser_factory.assert_called_once()
         self.hooks.wait_for_submission_review.assert_called_once()
 
+    def test_resume_logout_failure_does_not_misclassify_accepted_purchase(self):
+        def accepted(*args):
+            self.client.submission_locked = True
+            return 'SUCCESS'
+        self.client.purchase.side_effect = accepted
+        self.hooks.pause_for_payment.return_value = 'RESUME'
+        self.client.logout.side_effect = [APIReadError('logout unavailable'), {'logoutHTTP':None}]
+        with patch('asnb.api_runner.HTTPPortal', return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'), \
+                patch('asnb.api_runner.open_confirmation'):
+            self.run_runner()
+        self.client.purchase.assert_called_once()
+        self.assertEqual(self.client.login.call_count, 2)
+        self.client.reset.assert_called_once()
+        self.assertFalse(self.client.submission_locked)
+        self.hooks.wait_for_submission_review.assert_not_called()
+
     def test_browser_setup_failure_prevents_purchase(self):
         self.client.purchase.return_value='SUCCESS'
         self.browser_factory.side_effect=RuntimeError('browser unavailable')

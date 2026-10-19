@@ -250,7 +250,13 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                 hooks.close_webdriver(browser)
                 browser = None
                 client.driver = None
-                client.logout()
+                # The user has explicitly reviewed/completed payment. Logout is
+                # session cleanup, not another subscription acknowledgement.
+                try:
+                    client.logout()
+                except APIReadError:
+                    print('Post-payment logout not acknowledged; local session discarded. Starting fresh HTTP login.')
+                    client.reset()
                 client.submission_locked = False
                 client.confirmation = None
                 login()
