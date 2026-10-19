@@ -4,6 +4,9 @@ from unittest.mock import Mock, patch
 from asnb.api import APIReadError, APISessionExpired
 from asnb.api_runner import run_http_runner, cooldown_status, hold_status
 from asnb.handoff import HandoffError
+from asnb.http_portal import LoginBootstrapUnavailable
+from asnb.driver import DriverSetupError
+from selenium.common.exceptions import TimeoutException
 
 
 class APIRunnerTests(unittest.TestCase):
@@ -301,6 +304,37 @@ class APIRunnerTests(unittest.TestCase):
         self.client.purchase.assert_not_called()
         self.browser_factory.assert_called_once()
 
+    def test_browser_startup_recovers_without_relogin_or_early_purchase(self):
+        self.browser_factory.side_effect = [DriverSetupError('private details'), Mock()]
+        self.client.purchase.return_value = 'INSUFFICIENT'
+        with patch('asnb.api_runner.HTTPPortal', return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'):
+            self.run_runner(loops=2)
+        self.client.login.assert_called_once()
+        self.client.purchase.assert_called_once()
+        self.assertEqual(self.browser_factory.call_count, 2)
+        self.assertEqual(self.sleep.call_args_list[0].args, (5,))
+        self.assertNotIn('private details', str(self.hooks.print.call_args_list))
+
+    def test_portfolio_navigation_timeout_closes_browser_before_retry(self):
+        self.client.purchase.return_value = 'INSUFFICIENT'
+        with patch('asnb.api_runner.HTTPPortal', return_value=self.client), \
+                patch('asnb.api_runner.import_http_session', side_effect=[TimeoutException('private URL'), None]):
+            self.run_runner(loops=2)
+        self.assertEqual(self.browser_factory.call_count, 2)
+        self.client.purchase.assert_called_once()
+        self.client.login.assert_called_once()
+        self.assertEqual(self.hooks.close_webdriver.call_count, 2)
+        self.assertNotIn('private URL', str(self.hooks.print.call_args_list))
+
+    def test_repeated_chrome_failures_never_dispatch_and_backoff_is_capped(self):
+        self.browser_factory.side_effect = DriverSetupError('unavailable')
+        with patch('asnb.api_runner.HTTPPortal', return_value=self.client):
+            self.run_runner(loops=7)
+        self.client.purchase.assert_not_called()
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list], [5,10,20,40,60,60,60])
+        self.client.login.assert_called_once()
+
     def test_session_transfer_failure_prevents_purchase(self):
         with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
                 patch('asnb.api_runner.import_http_session',side_effect=HandoffError('transfer failed')):
@@ -354,3 +388,34 @@ class APIRunnerTests(unittest.TestCase):
         self.client.login.assert_called_once()
         self.client.purchase.assert_not_called()
         self.browser_factory.assert_not_called()
+
+    def test_transient_public_bootstrap_retries_with_capped_backoff_before_ordering(self):
+        self.client.login.side_effect=[LoginBootstrapUnavailable('public GET unavailable')]*6+[True]
+        self.client.purchase.return_value='BLOCKED'
+        self.client.block_seconds=300
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'):
+            self.run_runner()
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list],[5,10,20,40,60,60])
+        self.assertEqual(self.client.login.call_count,7)
+        self.client.purchase.assert_called_once()
+
+    def test_bootstrap_throttle_waits_in_bounded_chunks_before_retry(self):
+        self.client.login.side_effect=[LoginBootstrapUnavailable('public HTTP 429',retry_after=120),True]
+        self.client.purchase.return_value='BLOCKED'
+        self.client.block_seconds=300
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client), \
+                patch('asnb.api_runner.import_http_session'):
+            self.run_runner()
+        self.assertEqual([call.args[0] for call in self.sleep.call_args_list],[60,60])
+        self.assertEqual(self.client.login.call_count,2)
+
+    def test_expiry_then_bootstrap_failure_recovers_without_purchase_replay(self):
+        self.client.login.side_effect=[True,LoginBootstrapUnavailable('public timeout'),True]
+        self.client.preflight.side_effect=APISessionExpired()
+        with patch('asnb.api_runner.HTTPPortal',return_value=self.client):
+            self.run_runner()
+        self.assertEqual(self.client.login.call_count,3)
+        self.client.purchase.assert_not_called()
+        self.browser_factory.assert_not_called()
+        self.hooks.stats.record_refresh.assert_called_once()

@@ -217,6 +217,8 @@ are ignored by Git. Set `network_trace = false` to disable Chrome collection.
 | Problem | Action |
 | --- | --- |
 | Login rejected or active-session conflict | Check credentials/session status; HTTP login stops without credential retries. |
+| Public login page/script temporarily unavailable | Public GETs retry with 5–60 second backoff; numeric Retry-After is respected. Credentials and ordering remain paused. |
+| Chrome startup or portfolio navigation times out before submission | Initialization retries with 5–60 second backoff using the HTTP session; logs show the stage and exception type. No purchase is sent until initialization succeeds. |
 | HTTP 524, timeout or REVIEW | Inspect transaction history/pending payment. Do not assume the order failed. |
 | Bank unavailable | Match its display name in `config.ini.template`, such as `Maybank2U`. |
 | UI elements or funds missing | Portal structure/session state may have changed; inspect local diagnostics. |

@@ -22,6 +22,13 @@ class LoginError(APIReadError):
     pass
 
 
+class LoginBootstrapUnavailable(LoginError):
+    """Transient public GET failure before any credential POST was sent."""
+    def __init__(self, message, retry_after=0):
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 def _auth_errors(body):
     errors = body.get('errors') if isinstance(body, dict) else None
     if isinstance(errors, dict):
@@ -150,30 +157,47 @@ class HTTPPortal(PortalAPI):
         finally:
             self.last_write['elapsed_ms'] = round((time.monotonic() - started) * 1000)
 
+    def _bootstrap_get(self, url, stage, limit=1024 * 1024):
+        try:
+            response = self.session.get(url, timeout=(5, 30), allow_redirects=False, stream=True)
+        except (requests.Timeout, requests.ConnectionError,
+                requests.exceptions.ChunkedEncodingError, requests.exceptions.ContentDecodingError) as error:
+            raise LoginBootstrapUnavailable(
+                f'Public {stage} unavailable ({type(error).__name__}); no credentials sent') from None
+        status = response.status_code
+        retry = str(response.headers.get('Retry-After', ''))
+        try:
+            raw = self._body(response, limit)
+        except (requests.Timeout, requests.ConnectionError,
+                requests.exceptions.ChunkedEncodingError, requests.exceptions.ContentDecodingError) as error:
+            raise LoginBootstrapUnavailable(
+                f'Public {stage} unavailable ({type(error).__name__}); no credentials sent') from None
+        if status == 429 or 500 <= status <= 599:
+            seconds = min(86400, max(1, int(retry))) if retry.isdigit() else (300 if status == 429 else 0)
+            raise LoginBootstrapUnavailable(
+                f'Public {stage} unavailable (HTTP {status}); no credentials sent', seconds)
+        if status != 200:
+            raise LoginError(f'Public {stage} refused (HTTP {status}); manual review required')
+        return raw
+
     def _login_material(self):
         """Read the current public frontend's normal login serialization material."""
         try:
-            page = self.session.get(PORTAL + '/login', timeout=(5, 20), allow_redirects=False, stream=True)
-            status = page.status_code
-            html = self._body(page).decode()
-            if status != 200:
-                raise LoginError('Login bootstrap unavailable; no credential retry')
+            html = self._bootstrap_get(PORTAL + '/login', 'login page').decode()
             match = re.search(r'(?:src|href)=["\']([^"\']*index-[^"\']+\.js)["\']', html)
             url = urljoin(PORTAL, match[1]) if match else ''
             parsed = urlsplit(url)
             if parsed.scheme != 'https' or parsed.netloc != 'www.myasnb.com.my' or not parsed.path.startswith('/assets/') or parsed.query:
                 raise LoginError('Frontend login contract changed; manual review required')
-            response = self.session.get(url, timeout=(5, 30), allow_redirects=False, stream=True)
-            status = response.status_code
-            source = self._body(response, 10 * 1024 * 1024).decode()
+            source = self._bootstrap_get(url, 'frontend script', 10 * 1024 * 1024).decode()
             key = re.search(r'Hs=sl\.connectionWV,to="([^"]+)"', source)
-            if status != 200 or not key or 'setProtectedHeader({alg:"HS512"})' not in source:
+            if not key or 'setProtectedHeader({alg:"HS512"})' not in source:
                 raise LoginError('Frontend login contract changed; manual review required')
             return key[1].encode()
         except LoginError:
             raise
-        except Exception:
-            raise LoginError('Login bootstrap unavailable; no credential retry') from None
+        except Exception as error:
+            raise LoginError(f'Login bootstrap unavailable ({type(error).__name__}); no credential retry') from None
 
     def login(self, username, password):
         if self.submission_locked:

@@ -9,7 +9,7 @@ import requests
 
 from asnb.api import APIReadError
 from asnb.handoff import HandoffError, import_http_session
-from asnb.http_portal import HTTPPortal, LoginError
+from asnb.http_portal import HTTPPortal, LoginError, LoginBootstrapUnavailable
 from tests.test_handoff import fixture
 
 
@@ -57,6 +57,65 @@ class HTTPPortalTests(unittest.TestCase):
             with self.assertRaises(LoginError):
                 self.api.login('demo','private')
         self.assertEqual(post.call_count, 2)  # phrase + one credential request
+
+    def test_public_bootstrap_failure_is_retryable_before_credentials(self):
+        for response in [Response({},status=503),Response({},status=524)]:
+            with self.subTest(status=response.status_code), \
+                    patch.object(self.api.session,'get',return_value=response), \
+                    patch.object(self.api,'_post') as post:
+                with self.assertRaisesRegex(LoginBootstrapUnavailable,f'HTTP {response.status_code}'):
+                    self.api.login('dummy','private')
+                post.assert_not_called()
+                self.assertTrue(response.closed)
+
+    def test_public_bootstrap_timeout_redacts_url_and_never_posts_credentials(self):
+        with patch.object(self.api.session,'get',side_effect=requests.ReadTimeout('private URL')), \
+                patch.object(self.api,'_post') as post:
+            with self.assertRaises(LoginBootstrapUnavailable) as failure:
+                self.api.login('dummy','private')
+        self.assertIn('ReadTimeout',str(failure.exception))
+        self.assertNotIn('private URL',str(failure.exception))
+        post.assert_not_called()
+
+    def test_public_bootstrap_body_timeout_is_also_retryable(self):
+        response=Response({})
+        response.iter_content=Mock(side_effect=requests.ConnectionError('private response'))
+        with patch.object(self.api.session,'get',return_value=response):
+            with self.assertRaises(LoginBootstrapUnavailable):
+                self.api._login_material()
+        self.assertTrue(response.closed)
+
+    def test_public_bootstrap_throttle_honors_numeric_retry_after(self):
+        response=Response({},status=429)
+        response.headers={'Retry-After':'120'}
+        with patch.object(self.api.session,'get',return_value=response):
+            with self.assertRaises(LoginBootstrapUnavailable) as failure:
+                self.api._login_material()
+        self.assertEqual(failure.exception.retry_after,120)
+
+    def test_interrupted_public_response_retries_without_credentials(self):
+        for kind in (requests.exceptions.ChunkedEncodingError, requests.exceptions.ContentDecodingError):
+            response = Response({})
+            response.iter_content = Mock(side_effect=kind('private response'))
+            with self.subTest(kind=kind.__name__), \
+                    patch.object(self.api.session, 'get', return_value=response), \
+                    patch.object(self.api, '_post') as post:
+                with self.assertRaises(LoginBootstrapUnavailable) as failure:
+                    self.api.login('dummy', 'private')
+                self.assertIn(kind.__name__, str(failure.exception))
+                self.assertNotIn('private response', str(failure.exception))
+                post.assert_not_called()
+                self.assertTrue(response.closed)
+
+    def test_access_refusal_and_contract_change_do_not_enter_transient_retry(self):
+        for response in [Response({},status=403),Response({})]:
+            with self.subTest(status=response.status_code), \
+                    patch.object(self.api.session,'get',return_value=response), \
+                    patch.object(self.api,'_post') as post:
+                with self.assertRaises(LoginError) as failure:
+                    self.api.login('dummy','private')
+                self.assertNotIsInstance(failure.exception,LoginBootstrapUnavailable)
+                post.assert_not_called()
 
 
     def test_post_has_no_redirect_or_transport_retry(self):

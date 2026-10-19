@@ -4,11 +4,13 @@ import itertools
 import math
 import random
 import time
+from selenium.common.exceptions import WebDriverException
 
 from .api import APIReadError, APISessionExpired, APIThrottled
 from .handoff import HandoffError, import_http_session, open_confirmation
-from .http_portal import HTTPPortal
+from .http_portal import HTTPPortal, LoginBootstrapUnavailable
 from .browser_transport import wait_for_portal_ready, sync_cookies
+from .driver import DriverSetupError
 
 
 def _fund_label(fund):
@@ -58,6 +60,7 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
     http_session_bootstrapped = False
     last_hold_states = {}
     purchase_attempts = {fund: 0 for fund in funds}
+    browser_failures = 0
 
     def stop_for_review(message):
         print(message)
@@ -78,12 +81,29 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
         http_session_bootstrapped = False
         last_hold_states.clear()
         print(f'HTTP login: subscription transport={subscription_transport}; no purchase-form navigation.')
-        try:
-            client.login(username, password)
-        except APIReadError as error:
-            print(str(error))
-            print('Authentication requires review. Stopping without credential retries.')
-            raise KeyboardInterrupt() from None
+        bootstrap_failures = 0
+        while True:
+            try:
+                client.login(username, password)
+                break
+            except LoginBootstrapUnavailable as error:
+                # This exception is restricted to public GETs before credentials.
+                # A rejected/lost credential POST never enters this retry path.
+                bootstrap_failures += 1
+                delay = max(error.retry_after, min(60, 5 * 2 ** min(bootstrap_failures - 1, 4)))
+                print(str(error))
+                print(f'Public login bootstrap retry {bootstrap_failures} in {delay}s; ordering remains paused.')
+                remaining = delay
+                while remaining > 0:
+                    step = min(60, remaining)
+                    time.sleep(step)
+                    remaining -= step
+                    if remaining:
+                        print(f'Public bootstrap cooldown: {remaining}s remaining; no requests sent.')
+            except APIReadError as error:
+                print(str(error))
+                print('Authentication requires review. Stopping without credential retries.')
+                raise KeyboardInterrupt() from None
         print('HTTP login verified by authenticated account and portfolio reads.')
         for line in client.balance_lines({f: hooks.fund_name_variants(f) for f in funds}):
             print(line)
@@ -138,9 +158,13 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                                          reuse_preflight=True)
                 if browser is None and (subscription_transport == 'chrome' or not http_session_bootstrapped):
                     print('Starting Chrome API transport and transferring the authenticated session.')
-                    browser = new_browser()
+                    stage = 'Chrome startup'
                     try:
+                        browser = new_browser()
+                        stage = 'session transfer'
+                        print('Chrome started; importing the HTTP session into the portfolio tab.')
                         import_http_session(browser, client)
+                        stage = 'portal initialization'
                         print('Waiting for the portal application and portfolio initialization before submitting.')
                         wait_for_portal_ready(browser, client.account)
                         if subscription_transport == 'http':
@@ -149,11 +173,30 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
                             http_session_bootstrapped = True
                         else:
                             client.driver = browser
+                    except APISessionExpired:
+                        raise
+                    except (DriverSetupError, WebDriverException, APIReadError) as error:
+                        # No subscription has been dispatched at this point. Retry
+                        # initialization on a later turn with a fresh preflight.
+                        browser_failures += 1
+                        delay = min(60, 5 * 2 ** min(browser_failures - 1, 4))
+                        print(f'{stage} unavailable ({type(error).__name__}); no purchase submitted. Retrying in {delay}s.')
+                        if browser is not None:
+                            try:
+                                hooks.close_webdriver(browser)
+                            except Exception:
+                                print('Failed Chrome cleanup unavailable.')
+                        browser = None
+                        client.driver = None
+                        time.sleep(delay)
+                        continue
                     except Exception:
-                        hooks.close_webdriver(browser)
+                        if browser is not None:
+                            hooks.close_webdriver(browser)
                         browser = None
                         client.driver = None
                         raise
+                    browser_failures = 0
                     print(f'Portal initialization complete; {subscription_transport} API transport ready.')
                     try:
                         browser.minimize_window()
@@ -215,12 +258,14 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
             except APISessionExpired:
                 if client.submission_locked:
                     stop_for_review('Session changed after dispatch; manual review required.')
+                print('Read-only API session expired; refreshing HTTP login before further ordering.')
                 client.logout()
                 if browser is not None:
                     hooks.close_webdriver(browser)
                     browser = None
                     client.driver = None
                 login()
+                hooks.stats.record_refresh()
             except APIThrottled as error:
                 for name in funds:
                     hooks.fund_cooldowns.mark_blocked(name, error.seconds)
@@ -236,10 +281,10 @@ def run_http_runner(username, password, funds, amount, bank, referral, loops,
         print(hooks.stats.summary())
     except KeyboardInterrupt:
         raise
-    except Exception:
+    except Exception as error:
         if client.submission_locked:
             stop_for_review('Runner failed after dispatch; no accepted/uncertain order will be replayed.')
-        print('HTTP runner stopped after an unexpected error; no credential retry.')
+        print(f'HTTP runner stopped after an unexpected error ({type(error).__name__}); no credential retry.')
         raise KeyboardInterrupt() from None
     finally:
         if browser is not None:
